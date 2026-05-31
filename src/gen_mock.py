@@ -39,9 +39,43 @@ for cm in class_matches:
         })
 
 out = """#include "openvr.h"
-#include <windows.h>
+#include <cstring>
 #include <iostream>
-#include <string.h>
+#include <fstream>
+#include <windows.h>
+#include <d3d11.h>
+
+struct SharedFrame {
+    uint32_t sequenceNumber;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+};
+
+static HANDLE hMapFile = NULL;
+static void* pBuf = NULL;
+static SharedFrame* pHeader = NULL;
+static uint8_t* pPixelData = NULL;
+static uint32_t frameSeq = 1;
+static ID3D11Texture2D* pStagingTexture = NULL;
+
+static void InitSharedMemory() {
+    if (hMapFile) return;
+    
+    const int mapSize = 16 + 1920 * 1080 * 4;
+    
+    HANDLE hFile = CreateFileA("C:\\\\vr_shared_frame.dat", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        hMapFile = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, 0, mapSize, NULL);
+        if (hMapFile) {
+            pBuf = MapViewOfFile(hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, mapSize);
+            if (pBuf) {
+                pHeader = (SharedFrame*)pBuf;
+                pPixelData = (uint8_t*)pBuf + sizeof(SharedFrame);
+            }
+        }
+    }
+}
 
 using namespace vr;
 
@@ -78,7 +112,66 @@ for iface, methods in interfaces.items():
             out += "        Sleep(11);\n"
             out += "        return vr::VRCompositorError_None;\n"
         elif m['name'] == 'Submit':
-            out += "        return vr::VRCompositorError_None;\n"
+            out += """        if (eEye != vr::Eye_Left) return vr::VRCompositorError_None;
+        if(pTexture && pTexture->handle && pTexture->eType == vr::TextureType_DirectX) {
+            ID3D11Texture2D* pGameTex = (ID3D11Texture2D*)pTexture->handle;
+            D3D11_TEXTURE2D_DESC desc;
+            pGameTex->GetDesc(&desc);
+            
+            ID3D11Device* pDevice = nullptr;
+            pGameTex->GetDevice(&pDevice);
+            
+            if (pDevice) {
+                ID3D11DeviceContext* pContext = nullptr;
+                pDevice->GetImmediateContext(&pContext);
+                
+                if (pContext) {
+                    if (!pStagingTexture) {
+                        D3D11_TEXTURE2D_DESC stDesc = desc;
+                        stDesc.Usage = D3D11_USAGE_STAGING;
+                        stDesc.BindFlags = 0;
+                        stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        stDesc.MiscFlags = 0;
+                        pDevice->CreateTexture2D(&stDesc, nullptr, &pStagingTexture);
+                    }
+                    
+                    if (pStagingTexture) {
+                        pContext->CopyResource(pStagingTexture, pGameTex);
+                        
+                        D3D11_MAPPED_SUBRESOURCE mapped;
+                        if (SUCCEEDED(pContext->Map(pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped))) {
+                            if (pHeader && pPixelData) {
+                                pHeader->width = desc.Width;
+                                pHeader->height = desc.Height;
+                                pHeader->format = desc.Format;
+                                
+                                uint8_t* dst = pPixelData;
+                                uint8_t* src = (uint8_t*)mapped.pData;
+                                uint32_t bytesPerRow = desc.Width * 4;
+                                
+                                for(uint32_t y = 0; y < desc.Height; ++y) {
+                                    memcpy(dst + y * bytesPerRow, src + y * mapped.RowPitch, bytesPerRow);
+                                }
+                                
+                                pHeader->sequenceNumber = ++frameSeq;
+                            }
+                            pContext->Unmap(pStagingTexture, 0);
+                        }
+                    }
+                    pContext->Release();
+                }
+                pDevice->Release();
+            }
+        }
+        return vr::VRCompositorError_None;
+"""
+        elif m['name'] == 'GetTimeSinceLastVsync':
+            out += "        static uint64_t frame = 0; frame++;\n"
+            out += "        if(pfSecondsSinceLastVsync) *pfSecondsSinceLastVsync = 0.011f;\n"
+            out += "        if(pulFrameCounter) *pulFrameCounter = frame;\n"
+            out += "        return true;\n"
+        elif m['name'] == 'GetTrackedDeviceActivityLevel':
+            out += "        return vr::k_EDeviceActivityLevel_UserInteraction;\n"
         elif m['name'] == 'GetDeviceToAbsoluteTrackingPose':
             out += "        if(pTrackedDevicePoseArray && unTrackedDevicePoseArrayCount > 0) { memset(pTrackedDevicePoseArray, 0, sizeof(vr::TrackedDevicePose_t) * unTrackedDevicePoseArrayCount); if(unTrackedDevicePoseArrayCount > 0) { pTrackedDevicePoseArray[0].bPoseIsValid = true; pTrackedDevicePoseArray[0].bDeviceIsConnected = true; pTrackedDevicePoseArray[0].eTrackingResult = vr::TrackingResult_Running_OK; pTrackedDevicePoseArray[0].mDeviceToAbsoluteTracking.m[0][0] = 1; pTrackedDevicePoseArray[0].mDeviceToAbsoluteTracking.m[1][1] = 1; pTrackedDevicePoseArray[0].mDeviceToAbsoluteTracking.m[2][2] = 1; } }\n"
         elif m['name'] == 'IsTrackedDeviceConnected':
@@ -192,8 +285,9 @@ out += """
     return nullptr;
 }
 
-extern "C" __declspec(dllexport) uint32_t VR_InitInternal2(vr::EVRInitError *peError, vr::EVRApplicationType eType, const char *pStartupInfo) {
+extern "C" __declspec(dllexport) intptr_t VR_InitInternal2(vr::EVRInitError *peError, vr::EVRApplicationType eType, const char *pStartupInfo) {
     if (peError) *peError = vr::VRInitError_None;
+    InitSharedMemory();
     return 1;
 }
 
@@ -219,7 +313,11 @@ extern "C" __declspec(dllexport) uint32_t VR_GetInitToken() {
 extern "C" __declspec(dllexport) void* VRControlPanel() { return nullptr; }
 extern "C" __declspec(dllexport) const char* VR_GetRuntimePath() { return ""; }
 extern "C" __declspec(dllexport) const char* VR_GetStringForHmdError(vr::EVRInitError error) { return ""; }
-extern "C" __declspec(dllexport) uint32_t VR_InitInternal(vr::EVRInitError *peError, vr::EVRApplicationType eType) { if(peError) *peError = vr::VRInitError_None; return 1; }
+extern "C" __declspec(dllexport) intptr_t VR_InitInternal(vr::EVRInitError *peError, vr::EVRApplicationType eType) {
+    if (peError) *peError = vr::VRInitError_None;
+    InitSharedMemory();
+    return 1;
+}
 extern "C" __declspec(dllexport) bool VR_IsInterfaceVersionValid(const char *pchInterfaceVersion) { return true; }
 extern "C" __declspec(dllexport) bool VR_IsRuntimeInstalled() { return true; }
 
