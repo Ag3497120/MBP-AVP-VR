@@ -16,8 +16,10 @@ void LogMsg(const char* msg) {
 #include <cstring>
 #include <iostream>
 #include <fstream>
+#include <map>
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 
 struct SharedFrame {
     uint32_t sequenceNumber;
@@ -28,10 +30,19 @@ struct SharedFrame {
 
 #pragma pack(push, 1)
 struct SharedHands {
+    float headTransform[16];
     float leftTransform[16];
     float rightTransform[16];
     uint8_t leftPinch;
     uint8_t rightPinch;
+    uint32_t rightButtons;
+    uint32_t leftButtons;
+    float rightStickX;
+    float rightStickY;
+    float leftStickX;
+    float leftStickY;
+    float rightVelocity[3];
+    float leftVelocity[3];
 };
 #pragma pack(pop)
 
@@ -43,10 +54,12 @@ static SharedHands* pSharedHands = NULL;
 static uint32_t frameSeq = 1;
 static ID3D11Texture2D* pStagingTexture = NULL;
 
+float g_handVelocityL[3] = {0,0,0};
+float g_handVelocityR[3] = {0,0,0};
 static void InitSharedMemory() {
     if (hMapFile) return;
     
-    const int mapSize = 16 + 1920 * 1080 * 4 + 130;
+    const int mapSize = 16 + 4096 * 4096 * 4 + 194;
     
     HANDLE hFile = CreateFileA("C:\\vr_shared_frame.dat", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
@@ -63,7 +76,7 @@ static void InitSharedMemory() {
             if (pBuf) {
                 pHeader = (SharedFrame*)pBuf;
                 pPixelData = (uint8_t*)pBuf + sizeof(SharedFrame);
-                pSharedHands = (SharedHands*)((uint8_t*)pBuf + 16 + 1920 * 1080 * 4);
+                pSharedHands = (SharedHands*)((uint8_t*)pBuf + 16 + 4096 * 4096 * 4);
                 memset(pSharedHands, 0, sizeof(SharedHands));
             }
         }
@@ -208,8 +221,14 @@ public:
         if(pfLeft) *pfLeft = -1.0f; if(pfRight) *pfRight = 1.0f; if(pfTop) *pfTop = -1.0f; if(pfBottom) *pfBottom = 1.0f;
     }
     virtual bool ComputeDistortion(EVREye eEye, float fU, float fV, DistortionCoordinates_t *pDistortionCoordinates) override {
-        LogMsg("Called: IVRSystem::ComputeDistortion\n");
-        if(pDistortionCoordinates) { memset(pDistortionCoordinates, 0, sizeof(*pDistortionCoordinates)); }
+        if(pDistortionCoordinates) {
+            pDistortionCoordinates->rfRed[0] = fU;
+            pDistortionCoordinates->rfRed[1] = fV;
+            pDistortionCoordinates->rfGreen[0] = fU;
+            pDistortionCoordinates->rfGreen[1] = fV;
+            pDistortionCoordinates->rfBlue[0] = fU;
+            pDistortionCoordinates->rfBlue[1] = fV;
+        }
         return true;
     }
     virtual vr::HmdMatrix34_t* GetEyeToHeadTransform(HmdMatrix34_t *pRet, EVREye eEye) override {
@@ -219,7 +238,6 @@ public:
         return pRet;
     }
     virtual bool GetTimeSinceLastVsync(float *pfSecondsSinceLastVsync, uint64_t *pulFrameCounter) override {
-        LogMsg("Called: IVRSystem::GetTimeSinceLastVsync\n");
         static uint64_t frame = 0; frame++;
         if(pfSecondsSinceLastVsync) *pfSecondsSinceLastVsync = 0.011f;
         if(pulFrameCounter) *pulFrameCounter = frame;
@@ -247,7 +265,26 @@ public:
     }
     virtual void GetDeviceToAbsoluteTrackingPose(ETrackingUniverseOrigin eOrigin, float fPredictedSecondsToPhotonsFromNow, VR_ARRAY_COUNT(unTrackedDevicePoseArrayCount) TrackedDevicePose_t *pTrackedDevicePoseArray, uint32_t unTrackedDevicePoseArrayCount) override {
         LogMsg("Called: IVRSystem::GetDeviceToAbsoluteTrackingPose\n");
-        if(pTrackedDevicePoseArray && unTrackedDevicePoseArrayCount > 0) { memset(pTrackedDevicePoseArray, 0, sizeof(vr::TrackedDevicePose_t) * unTrackedDevicePoseArrayCount); for(uint32_t i=0; i<3 && i<unTrackedDevicePoseArrayCount; ++i) { pTrackedDevicePoseArray[i].bPoseIsValid = true; pTrackedDevicePoseArray[i].bDeviceIsConnected = true; pTrackedDevicePoseArray[i].eTrackingResult = vr::TrackingResult_Running_OK; pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1; pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1; pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1; } }
+        if(pTrackedDevicePoseArray && unTrackedDevicePoseArrayCount > 0) { 
+            memset(pTrackedDevicePoseArray, 0, sizeof(vr::TrackedDevicePose_t) * unTrackedDevicePoseArrayCount); 
+            for(uint32_t i=0; i<3 && i<unTrackedDevicePoseArrayCount; ++i) { 
+                pTrackedDevicePoseArray[i].bPoseIsValid = true; 
+                pTrackedDevicePoseArray[i].bDeviceIsConnected = true; 
+                pTrackedDevicePoseArray[i].eTrackingResult = vr::TrackingResult_Running_OK; 
+                
+                if (i == 0 && pSharedHands && pSharedHands->headTransform[0] != 0.0f) {
+                    for(int r=0;r<3;r++) for(int c=0;c<4;c++) pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->headTransform[c*4 + r];
+                } else if (i == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
+                    for(int r=0;r<3;r++) for(int c=0;c<4;c++) pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->leftTransform[c*4 + r];
+                } else if (i == 2 && pSharedHands && pSharedHands->rightTransform[0] != 0.0f) {
+                    for(int r=0;r<3;r++) for(int c=0;c<4;c++) pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->rightTransform[c*4 + r];
+                } else {
+                    pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1; 
+                    pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1; 
+                    pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1; 
+                }
+            } 
+        }
     }
     virtual void ResetSeatedZeroPose() override {
         LogMsg("Called: IVRSystem::ResetSeatedZeroPose\n");
@@ -271,7 +308,6 @@ public:
         return (uint32_t)0;
     }
     virtual EDeviceActivityLevel GetTrackedDeviceActivityLevel(vr::TrackedDeviceIndex_t unDeviceId) override {
-        LogMsg("Called: IVRSystem::GetTrackedDeviceActivityLevel\n");
         return vr::k_EDeviceActivityLevel_UserInteraction;
     }
     virtual void ApplyTransform(TrackedDevicePose_t *pOutputPose, const TrackedDevicePose_t *pTrackedDevicePose, const HmdMatrix34_t *pTransform) override {
@@ -279,7 +315,9 @@ public:
     }
     virtual vr::TrackedDeviceIndex_t GetTrackedDeviceIndexForControllerRole(vr::ETrackedControllerRole unDeviceType) override {
         LogMsg("Called: IVRSystem::GetTrackedDeviceIndexForControllerRole\n");
-        return (vr::TrackedDeviceIndex_t)0;
+        if (unDeviceType == vr::TrackedControllerRole_LeftHand) return 1;
+        if (unDeviceType == vr::TrackedControllerRole_RightHand) return 2;
+        return vr::k_unTrackedDeviceIndexInvalid;
     }
     virtual vr::ETrackedControllerRole GetControllerRoleForTrackedDeviceIndex(vr::TrackedDeviceIndex_t unDeviceIndex) override {
         LogMsg("Called: IVRSystem::GetControllerRoleForTrackedDeviceIndex\n");
@@ -288,11 +326,8 @@ public:
         return vr::TrackedControllerRole_Invalid;
     }
     virtual ETrackedDeviceClass GetTrackedDeviceClass(vr::TrackedDeviceIndex_t unDeviceIndex) override {
-        LogMsg("Called: IVRSystem::GetTrackedDeviceClass\n");
         if (unDeviceIndex == vr::k_unTrackedDeviceIndex_Hmd) return vr::TrackedDeviceClass_HMD;
-        // Temporarily disable controllers to see if they are causing the dxgi crash at map load end
-        // if (unDeviceIndex == 1) return vr::TrackedDeviceClass_Controller;
-        // if (unDeviceIndex == 2) return vr::TrackedDeviceClass_Controller;
+        if (unDeviceIndex == 1 || unDeviceIndex == 2) return vr::TrackedDeviceClass_Controller;
         return vr::TrackedDeviceClass_Invalid;
     }
     virtual bool IsTrackedDeviceConnected(vr::TrackedDeviceIndex_t unDeviceIndex) override {
@@ -305,7 +340,6 @@ public:
         return false;
     }
     virtual float GetFloatTrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
-        LogMsg("Called: IVRSystem::GetFloatTrackedDeviceProperty\n");
         if(pError) *pError = vr::TrackedProp_Success;
         if(prop == vr::Prop_DisplayFrequency_Float) return 90.0f;
         return 0.0f;
@@ -315,7 +349,9 @@ public:
         if(pError) *pError = vr::TrackedProp_Success;
         if(prop == vr::Prop_DeviceClass_Int32) { if(unDeviceIndex == 0) return vr::TrackedDeviceClass_HMD; if(unDeviceIndex == 1 || unDeviceIndex == 2) return vr::TrackedDeviceClass_Controller; }
         if(prop == vr::Prop_ControllerRoleHint_Int32) { if(unDeviceIndex == 1) return vr::TrackedControllerRole_LeftHand; if(unDeviceIndex == 2) return vr::TrackedControllerRole_RightHand; }
-        if(prop == vr::Prop_Axis0Type_Int32 || prop == vr::Prop_Axis1Type_Int32) return vr::k_eControllerAxis_TrackPad;
+        if(prop == vr::Prop_Axis0Type_Int32) return vr::k_eControllerAxis_TrackPad;
+        if(prop == vr::Prop_Axis1Type_Int32) return vr::k_eControllerAxis_Trigger;
+        if(prop == vr::Prop_Axis2Type_Int32) return vr::k_eControllerAxis_Joystick;
         return 0;
     }
     virtual uint64_t GetUint64TrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
@@ -337,16 +373,45 @@ public:
         return (uint32_t)0;
     }
     virtual uint32_t GetStringTrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, VR_OUT_STRING() char *pchValue, uint32_t unBufferSize, ETrackedPropertyError *pError = 0L) override {
-        LogMsg("Called: IVRSystem::GetStringTrackedDeviceProperty\n");
-        const char* s = "Generic";
+        const char* s = "";
+        bool handled = true;
         if (prop == vr::Prop_RenderModelName_String) {
             if (unDeviceIndex == 0) s = "generic_hmd";
             else if (unDeviceIndex == 1) s = "{indexcontroller}valve_controller_knu_1_0_left";
             else if (unDeviceIndex == 2) s = "{indexcontroller}valve_controller_knu_1_0_right";
         }
-        if (prop == vr::Prop_ControllerType_String) s = "knuckles";
-        if (prop == vr::Prop_TrackingSystemName_String) s = "lighthouse";
-        if (prop == vr::Prop_ManufacturerName_String) s = "Valve";
+        else if (prop == vr::Prop_ControllerType_String) s = "knuckles";
+        else if (prop == vr::Prop_TrackingSystemName_String) s = "lighthouse";
+        else if (prop == vr::Prop_ManufacturerName_String) s = "Valve";
+        else if (prop == vr::Prop_ResourceRoot_String) s = "indexcontroller";
+        else if (prop == vr::Prop_RegisteredDeviceType_String) {
+            if (unDeviceIndex == 1) s = "valve/index_controllerLHR-FFFFFFFF";
+            else if (unDeviceIndex == 2) s = "valve/index_controllerLHR-EEEEEEEE";
+        }
+        else if (prop == vr::Prop_SerialNumber_String) {
+            if (unDeviceIndex == 1) s = "LHR-FFFFFFFF";
+            else if (unDeviceIndex == 2) s = "LHR-EEEEEEEE";
+            else s = "LHR-DDDDDDDD";
+        }
+        else if (prop == vr::Prop_ModelNumber_String) {
+            if (unDeviceIndex == 1) s = "Knuckles Left";
+            else if (unDeviceIndex == 2) s = "Knuckles Right";
+            else s = "HMD";
+        }
+        else if (prop == vr::Prop_InputProfilePath_String) {
+            s = "{indexcontroller}/input/index_controller_profile.json";
+        }
+        else if (prop == vr::Prop_AttachedDeviceId_String) {
+            if (unDeviceIndex == 1) s = "123456789";
+            else if (unDeviceIndex == 2) s = "987654321";
+        } else {
+            handled = false;
+            char msg[256];
+            snprintf(msg, sizeof(msg), "Unhandled String Prop: %d for device %d\n", prop, unDeviceIndex);
+            LogMsg(msg);
+            s = "Generic";
+        }
+
         if(pchValue && unBufferSize > 0) { strncpy(pchValue, s, unBufferSize - 1); pchValue[unBufferSize - 1] = '\0'; }
         if(pError) *pError = vr::TrackedProp_Success;
         return (uint32_t)strlen(s) + 1;
@@ -355,13 +420,66 @@ public:
         LogMsg("Called: IVRSystem::GetPropErrorNameFromEnum\n");
         return "1.10.30";
     }
-    virtual bool PollNextEvent(VREvent_t *pEvent, uint32_t uncbVREvent) override {
-        LogMsg("Called: IVRSystem::PollNextEvent\n");
-        static int count = 0; if (count == 0) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)100; pEvent->trackedDeviceIndex = 0; } return true; } else if (count == 1) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)403; pEvent->trackedDeviceIndex = 0; } return true; } return false;
-    }
-    virtual bool PollNextEventWithPose(ETrackingUniverseOrigin eOrigin, VREvent_t *pEvent, uint32_t uncbVREvent, vr::TrackedDevicePose_t *pTrackedDevicePose) override {
-        LogMsg("Called: IVRSystem::PollNextEventWithPose\n");
+    virtual bool PollNextEvent(vr::VREvent_t *pEvent, uint32_t uncbVREvent) override {
+        static int count = 0;
+        if (count == 0) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)100; pEvent->trackedDeviceIndex = 0; } return true; }
+        else if (count == 1) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)100; pEvent->trackedDeviceIndex = 1; } return true; }
+        else if (count == 2) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)100; pEvent->trackedDeviceIndex = 2; } return true; }
+        else if (count == 3) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)403; pEvent->trackedDeviceIndex = 0; } return true; }
+
+        static uint64_t lastLeftVRButtons = 0;
+        static uint64_t lastRightVRButtons = 0;
+        
+        if (pSharedHands && pEvent) {
+            uint32_t lb = pSharedHands->leftButtons;
+            uint32_t rb = pSharedHands->rightButtons;
+            uint64_t currentLeftVRButtons = 0;
+            uint64_t currentRightVRButtons = 0;
+            
+            if (pSharedHands->leftPinch) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
+            if (lb & (1<<4)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); // ZL
+            if (lb & (1<<5)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // L3
+            if (lb & (1<<6)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_System); // Minus
+
+            if (pSharedHands->rightPinch) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
+            if (rb & (1<<2)) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); // ZR
+            if (rb & (1<<0)) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_A); // A
+            if (rb & (1<<1)) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu); // B -> App Menu
+            if (rb & (1<<3)) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // R3
+            if (rb & (1<<4)) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_System); // Plus
+
+            uint64_t leftDiff = currentLeftVRButtons ^ lastLeftVRButtons;
+            if (leftDiff != 0) {
+                for (int i = 0; i < 64; i++) {
+                    if (leftDiff & (1ULL << i)) {
+                        memset(pEvent, 0, uncbVREvent);
+                        pEvent->trackedDeviceIndex = 1;
+                        pEvent->data.controller.button = i;
+                        pEvent->eventType = (currentLeftVRButtons & (1ULL << i)) ? (vr::EVREventType)200 : (vr::EVREventType)201;
+                        lastLeftVRButtons = (lastLeftVRButtons & ~(1ULL << i)) | (currentLeftVRButtons & (1ULL << i));
+                        return true;
+                    }
+                }
+            }
+
+            uint64_t rightDiff = currentRightVRButtons ^ lastRightVRButtons;
+            if (rightDiff != 0) {
+                for (int i = 0; i < 64; i++) {
+                    if (rightDiff & (1ULL << i)) {
+                        memset(pEvent, 0, uncbVREvent);
+                        pEvent->trackedDeviceIndex = 2;
+                        pEvent->data.controller.button = i;
+                        pEvent->eventType = (currentRightVRButtons & (1ULL << i)) ? (vr::EVREventType)200 : (vr::EVREventType)201;
+                        lastRightVRButtons = (lastRightVRButtons & ~(1ULL << i)) | (currentRightVRButtons & (1ULL << i));
+                        return true;
+                    }
+                }
+            }
+        }
         return false;
+    }
+    virtual bool PollNextEventWithPose(ETrackingUniverseOrigin eOrigin, vr::VREvent_t *pEvent, uint32_t uncbVREvent, vr::TrackedDevicePose_t *pTrackedDevicePose) override {
+        return PollNextEvent(pEvent, uncbVREvent);
     }
     virtual const char * GetEventTypeNameFromEnum(EVREventType eType) override {
         LogMsg("Called: IVRSystem::GetEventTypeNameFromEnum\n");
@@ -369,18 +487,56 @@ public:
     }
     virtual vr::HiddenAreaMesh_t* GetHiddenAreaMesh(HiddenAreaMesh_t *pRet, EVREye eEye, EHiddenAreaMeshType type = k_eHiddenAreaMesh_Standard) override {
         LogMsg("Called: IVRSystem::GetHiddenAreaMesh\n");
-        if(pRet) { memset(pRet, 0, sizeof(*pRet)); }
-        if(pRet) { pRet->pVertexData = nullptr; pRet->unTriangleCount = 0; }
+        static vr::HmdVector2_t dummy_verts[3] = { { 2.0f, 2.0f }, { 2.0f, 2.1f }, { 2.1f, 2.0f } };
+        if(pRet) { 
+            pRet->pVertexData = dummy_verts; 
+            pRet->unTriangleCount = 1; 
+        }
         return pRet;
     }
     virtual bool GetControllerState(vr::TrackedDeviceIndex_t unControllerDeviceIndex, vr::VRControllerState_t *pControllerState, uint32_t unControllerStateSize) override {
-        LogMsg("Called: IVRSystem::GetControllerState\n");
-        if(pControllerState) memset(pControllerState, 0, unControllerStateSize);
+        if(pControllerState) {
+            memset(pControllerState, 0, unControllerStateSize);
+            pControllerState->unPacketNum = frameSeq;
+            if (pSharedHands) {
+                uint32_t lb = pSharedHands->leftButtons;
+                uint32_t rb = pSharedHands->rightButtons;
+                if (unControllerDeviceIndex == 1) {
+                    if (pSharedHands->leftPinch) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
+                    if (lb & (1<<4)) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } // ZL
+                    if (lb & (1<<5)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // L3
+                    if (lb & (1<<6)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_System); // Minus
+                    pControllerState->rAxis[0].x = pSharedHands->leftStickX;
+                    pControllerState->rAxis[0].y = -pSharedHands->leftStickY;
+                } else if (unControllerDeviceIndex == 2) {
+                    if (pSharedHands->rightPinch) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
+                    if (rb & (1<<2)) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } // ZR
+                    if (rb & (1<<0)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_A); // A
+                    if (rb & (1<<1)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu); // B -> App Menu
+                    if (rb & (1<<3)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // R3
+                    if (rb & (1<<4)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_System); // Plus
+                    pControllerState->rAxis[0].x = pSharedHands->rightStickX;
+                    pControllerState->rAxis[0].y = -pSharedHands->rightStickY;
+                }
+            }
+        }
         return true;
     }
     virtual bool GetControllerStateWithPose(ETrackingUniverseOrigin eOrigin, vr::TrackedDeviceIndex_t unControllerDeviceIndex, vr::VRControllerState_t *pControllerState, uint32_t unControllerStateSize, TrackedDevicePose_t *pTrackedDevicePose) override {
-        LogMsg("Called: IVRSystem::GetControllerStateWithPose\n");
-        if(pControllerState) memset(pControllerState, 0, unControllerStateSize);
+        GetControllerState(unControllerDeviceIndex, pControllerState, unControllerStateSize);
+        if(pTrackedDevicePose) {
+            memset(pTrackedDevicePose, 0, sizeof(vr::TrackedDevicePose_t));
+            pTrackedDevicePose->bPoseIsValid = true;
+            pTrackedDevicePose->bDeviceIsConnected = true;
+            pTrackedDevicePose->eTrackingResult = vr::TrackingResult_Running_OK;
+            if (unControllerDeviceIndex == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
+                for(int r=0;r<3;r++) for(int c=0;c<4;c++) pTrackedDevicePose->mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->leftTransform[c*4 + r];
+            } else if (unControllerDeviceIndex == 2 && pSharedHands && pSharedHands->rightTransform[0] != 0.0f) {
+                for(int r=0;r<3;r++) for(int c=0;c<4;c++) pTrackedDevicePose->mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->rightTransform[c*4 + r];
+            } else {
+                pTrackedDevicePose->mDeviceToAbsoluteTracking.m[0][0] = 1; pTrackedDevicePose->mDeviceToAbsoluteTracking.m[1][1] = 1; pTrackedDevicePose->mDeviceToAbsoluteTracking.m[2][2] = 1;
+            }
+        }
         return true;
     }
     virtual void TriggerHapticPulse(vr::TrackedDeviceIndex_t unControllerDeviceIndex, uint32_t unAxisId, unsigned short usDurationMicroSec) override {
@@ -547,10 +703,12 @@ public:
     }
     virtual EVRApplicationError GetApplicationKeyByIndex(uint32_t unApplicationIndex, VR_OUT_STRING() char *pchAppKeyBuffer, uint32_t unAppKeyBufferLen) override {
         LogMsg("Called: IVRApplications::GetApplicationKeyByIndex\n");
+        if (pchAppKeyBuffer && unAppKeyBufferLen > 0) pchAppKeyBuffer[0] = '\0';
         return (EVRApplicationError)1;
     }
     virtual EVRApplicationError GetApplicationKeyByProcessId(uint32_t unProcessId, VR_OUT_STRING() char *pchAppKeyBuffer, uint32_t unAppKeyBufferLen) override {
         LogMsg("Called: IVRApplications::GetApplicationKeyByProcessId\n");
+        if (pchAppKeyBuffer && unAppKeyBufferLen > 0) pchAppKeyBuffer[0] = '\0';
         return (EVRApplicationError)1;
     }
     virtual EVRApplicationError LaunchApplication(const char *pchAppKey) override {
@@ -587,6 +745,7 @@ public:
     }
     virtual uint32_t GetApplicationPropertyString(const char *pchAppKey, EVRApplicationProperty eProperty, VR_OUT_STRING() char *pchPropertyValueBuffer, uint32_t unPropertyValueBufferLen, EVRApplicationError *peError = nullptr) override {
         LogMsg("Called: IVRApplications::GetApplicationPropertyString\n");
+        if (pchPropertyValueBuffer && unPropertyValueBufferLen > 0) pchPropertyValueBuffer[0] = '\0';
         return (uint32_t)0;
     }
     virtual bool GetApplicationPropertyBool(const char *pchAppKey, EVRApplicationProperty eProperty, EVRApplicationError *peError = nullptr) override {
@@ -896,17 +1055,22 @@ public:
 
 class Mock_IVRChaperone : public vr::IVRChaperone {
 public:
-    virtual ChaperoneCalibrationState GetCalibrationState() override {
-        LogMsg("Called: IVRChaperone::GetCalibrationState\n");
-        return (ChaperoneCalibrationState)0;
+    virtual vr::ChaperoneCalibrationState GetCalibrationState() override {
+        return vr::ChaperoneCalibrationState_OK;
     }
     virtual bool GetPlayAreaSize(float *pSizeX, float *pSizeZ) override {
-        LogMsg("Called: IVRChaperone::GetPlayAreaSize\n");
-        return false;
+        if(pSizeX) *pSizeX = 1000.0f;
+        if(pSizeZ) *pSizeZ = 1000.0f;
+        return true;
     }
-    virtual bool GetPlayAreaRect(HmdQuad_t *rect) override {
-        LogMsg("Called: IVRChaperone::GetPlayAreaRect\n");
-        return false;
+    virtual bool GetPlayAreaRect(vr::HmdQuad_t *rect) override {
+        if(rect) {
+            rect->vCorners[0].v[0] = -500.0f; rect->vCorners[0].v[1] = 0.0f; rect->vCorners[0].v[2] = -500.0f;
+            rect->vCorners[1].v[0] = -500.0f; rect->vCorners[1].v[1] = 0.0f; rect->vCorners[1].v[2] =  500.0f;
+            rect->vCorners[2].v[0] =  500.0f; rect->vCorners[2].v[1] = 0.0f; rect->vCorners[2].v[2] =  500.0f;
+            rect->vCorners[3].v[0] =  500.0f; rect->vCorners[3].v[1] = 0.0f; rect->vCorners[3].v[2] = -500.0f;
+        }
+        return true;
     }
     virtual void ReloadInfo(void) override {
         LogMsg("Called: IVRChaperone::ReloadInfo\n");
@@ -914,8 +1078,21 @@ public:
     virtual void SetSceneColor(HmdColor_t color) override {
         LogMsg("Called: IVRChaperone::SetSceneColor\n");
     }
-    virtual void GetBoundsColor(HmdColor_t *pOutputColorArray, int nNumOutputColors, float flCollisionBoundsFadeDistance, HmdColor_t *pOutputCameraColor) override {
-        LogMsg("Called: IVRChaperone::GetBoundsColor\n");
+    virtual void GetBoundsColor(vr::HmdColor_t *pOutputColorArray, int nNumOutputColors, float flCollisionBoundsFadeDistance, vr::HmdColor_t *pOutputCameraColor) override {
+        if(pOutputColorArray) {
+            for(int i = 0; i < nNumOutputColors; ++i) {
+                pOutputColorArray[i].r = 0.0f;
+                pOutputColorArray[i].g = 0.0f;
+                pOutputColorArray[i].b = 0.0f;
+                pOutputColorArray[i].a = 0.0f;
+            }
+        }
+        if(pOutputCameraColor) {
+            pOutputCameraColor->r = 0.0f;
+            pOutputCameraColor->g = 0.0f;
+            pOutputCameraColor->b = 0.0f;
+            pOutputCameraColor->a = 0.0f;
+        }
     }
     virtual bool AreBoundsVisible() override {
         LogMsg("Called: IVRChaperone::AreBoundsVisible\n");
@@ -1217,12 +1394,31 @@ public:
                 pRenderPoseArray[i].bPoseIsValid = true;
                 pRenderPoseArray[i].bDeviceIsConnected = true;
                 pRenderPoseArray[i].eTrackingResult = vr::TrackingResult_Running_OK;
-                if (i == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
-                    for(int r=0;r<3;r++) for(int c=0;c<4;c++) pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->leftTransform[c*4 + r];
-                } else if (i == 2 && pSharedHands && pSharedHands->rightTransform[0] != 0.0f) {
-                    for(int r=0;r<3;r++) for(int c=0;c<4;c++) pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->rightTransform[c*4 + r];
-                } else {
-                    pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1; pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1; pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1;
+                if (pSharedHands) {
+                    float* srcTransform = nullptr;
+                    if (i == 0) srcTransform = pSharedHands->headTransform;
+                    else if (i == 1) srcTransform = pSharedHands->leftTransform;
+                    else if (i == 2) srcTransform = pSharedHands->rightTransform;
+                    
+                    // Fallback to head tracking if controller tracking is empty (e.g. JoyCon only)
+                    if (srcTransform && srcTransform[0] == 0.0f && i > 0) {
+                        srcTransform = pSharedHands->headTransform;
+                    }
+                    
+                    if (srcTransform && srcTransform[0] != 0.0f) {
+                        for(int r=0;r<3;r++) for(int c=0;c<4;c++) pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = srcTransform[c*4 + r];
+                        if (i > 0 && srcTransform == pSharedHands->headTransform) {
+                            // Offset controller slightly from head so laser isn't in eyes
+                            pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][3] += (i == 1) ? -0.2f : 0.2f;
+                            pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][3] -= 0.2f;
+                            pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][3] -= 0.3f;
+                        }
+                    } else {
+                        // Identity fallback
+                        pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1.0f;
+                        pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1.0f;
+                        pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1.0f;
+                    }
                 }
             }
         }
@@ -1232,15 +1428,67 @@ public:
                 pGamePoseArray[i].bPoseIsValid = true;
                 pGamePoseArray[i].bDeviceIsConnected = true;
                 pGamePoseArray[i].eTrackingResult = vr::TrackingResult_Running_OK;
-                if (i == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
-                    for(int r=0;r<3;r++) for(int c=0;c<4;c++) pGamePoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->leftTransform[c*4 + r];
-                } else if (i == 2 && pSharedHands && pSharedHands->rightTransform[0] != 0.0f) {
-                    for(int r=0;r<3;r++) for(int c=0;c<4;c++) pGamePoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->rightTransform[c*4 + r];
-                } else {
-                    pGamePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1; pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1; pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1;
+                if (pSharedHands) {
+                    float* srcTransform = nullptr;
+                    if (i == 0) srcTransform = pSharedHands->headTransform;
+                    else if (i == 1) srcTransform = pSharedHands->leftTransform;
+                    else if (i == 2) srcTransform = pSharedHands->rightTransform;
+                    
+                    if (srcTransform && srcTransform[0] == 0.0f && i > 0) {
+                        srcTransform = pSharedHands->headTransform;
+                    }
+                    
+                    if (srcTransform && srcTransform[0] != 0.0f) {
+                        for(int r=0;r<3;r++) for(int c=0;c<4;c++) pGamePoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = srcTransform[c*4 + r];
+                        if (i > 0 && srcTransform == pSharedHands->headTransform) {
+                            pGamePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] += (i == 1) ? -0.2f : 0.2f;
+                            pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] -= 0.2f;
+                            pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][3] -= 0.3f;
+                        }
+                    } else {
+                        pGamePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1.0f;
+                        pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1.0f;
+                        pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1.0f;
+                    }
                 }
             }
         }
+        
+// Removed local velocity declaration
+        static float lastLeft[3] = {0,0,0};
+        static float lastRight[3] = {0,0,0};
+        static DWORD lastTime = GetTickCount();
+        DWORD now = GetTickCount();
+        float dt = (now - lastTime) / 1000.0f;
+        if (dt < 0.001f) dt = 0.001f;
+        if (dt > 0.1f) dt = 0.1f;
+        
+        if (pSharedHands) {
+            float curLeft[3] = { pSharedHands->leftTransform[3], pSharedHands->leftTransform[7], pSharedHands->leftTransform[11] }; // Wait, translation is at indices 3, 7, 11 (if row-major) or 12, 13, 14 (if col-major)! In my previous code, I assigned m[r][c] = leftTransform[c*4+r]. That means 12,13,14 are translation!
+            float cL[3] = { pSharedHands->leftTransform[12], pSharedHands->leftTransform[13], pSharedHands->leftTransform[14] };
+            float cR[3] = { pSharedHands->rightTransform[12], pSharedHands->rightTransform[13], pSharedHands->rightTransform[14] };
+            
+            g_handVelocityL[0] = (cL[0]-lastLeft[0])/dt; g_handVelocityL[1] = (cL[1]-lastLeft[1])/dt; g_handVelocityL[2] = (cL[2]-lastLeft[2])/dt;
+            g_handVelocityR[0] = (cR[0]-lastRight[0])/dt; g_handVelocityR[1] = (cR[1]-lastRight[1])/dt; g_handVelocityR[2] = (cR[2]-lastRight[2])/dt;
+            
+            if (pRenderPoseArray && unRenderPoseArrayCount > 1) {
+                pRenderPoseArray[1].vVelocity.v[0] = g_handVelocityL[0]; pRenderPoseArray[1].vVelocity.v[1] = g_handVelocityL[1]; pRenderPoseArray[1].vVelocity.v[2] = g_handVelocityL[2];
+            }
+            if (pRenderPoseArray && unRenderPoseArrayCount > 2) {
+                pRenderPoseArray[2].vVelocity.v[0] = g_handVelocityR[0]; pRenderPoseArray[2].vVelocity.v[1] = g_handVelocityR[1]; pRenderPoseArray[2].vVelocity.v[2] = g_handVelocityR[2];
+            }
+            if (pGamePoseArray && unGamePoseArrayCount > 1) {
+                pGamePoseArray[1].vVelocity.v[0] = g_handVelocityL[0]; pGamePoseArray[1].vVelocity.v[1] = g_handVelocityL[1]; pGamePoseArray[1].vVelocity.v[2] = g_handVelocityL[2];
+            }
+            if (pGamePoseArray && unGamePoseArrayCount > 2) {
+                pGamePoseArray[2].vVelocity.v[0] = g_handVelocityR[0]; pGamePoseArray[2].vVelocity.v[1] = g_handVelocityR[1]; pGamePoseArray[2].vVelocity.v[2] = g_handVelocityR[2];
+            }
+            
+            lastLeft[0] = cL[0]; lastLeft[1] = cL[1]; lastLeft[2] = cL[2];
+            lastRight[0] = cR[0]; lastRight[1] = cR[1]; lastRight[2] = cR[2];
+        }
+        lastTime = now;
+        
         Sleep(11);
         return vr::VRCompositorError_None;
     }
@@ -1252,57 +1500,100 @@ public:
         LogMsg("Called: IVRCompositor::GetLastPoseForTrackedDeviceIndex\n");
         return (EVRCompositorError)1;
     }
-    virtual EVRCompositorError Submit(EVREye eEye, const Texture_t *pTexture, const VRTextureBounds_t* pBounds = 0, EVRSubmitFlags nSubmitFlags = Submit_Default) override {
-        LogMsg("Called: IVRCompositor::Submit\n");
-        if (eEye != vr::Eye_Left) return vr::VRCompositorError_None;
+    virtual EVRCompositorError Submit(vr::EVREye eEye, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t* pBounds, vr::EVRSubmitFlags nSubmitFlags) override {
         if(pTexture && pTexture->handle && pTexture->eType == vr::TextureType_DirectX) {
             ID3D11Texture2D* pGameTex = (ID3D11Texture2D*)pTexture->handle;
             D3D11_TEXTURE2D_DESC desc;
             pGameTex->GetDesc(&desc);
             
-            ID3D11Device* pDevice = nullptr;
-            pGameTex->GetDevice(&pDevice);
-            
-            if (pDevice) {
-                ID3D11DeviceContext* pContext = nullptr;
-                pDevice->GetImmediateContext(&pContext);
-                
-                if (pContext) {
-                    if (!pStagingTexture) {
-                        D3D11_TEXTURE2D_DESC stDesc = desc;
-                        stDesc.Usage = D3D11_USAGE_STAGING;
-                        stDesc.BindFlags = 0;
-                        stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                        stDesc.MiscFlags = 0;
-                        pDevice->CreateTexture2D(&stDesc, nullptr, &pStagingTexture);
-                    }
+            if ((eEye == vr::Eye_Left || eEye == vr::Eye_Right) && hMapFile) {
+                ID3D11Device* pDevice = nullptr;
+                pGameTex->GetDevice(&pDevice);
+                if (pDevice) {
+                    ID3D11DeviceContext* pContext = nullptr;
+                    pDevice->GetImmediateContext(&pContext);
                     
-                    if (pStagingTexture) {
-                        pContext->CopyResource(pStagingTexture, pGameTex);
-                        
-                        D3D11_MAPPED_SUBRESOURCE mapped;
-                        if (SUCCEEDED(pContext->Map(pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped))) {
-                            if (pHeader && pPixelData) {
-                                pHeader->width = desc.Width;
-                                pHeader->height = desc.Height;
-                                pHeader->format = desc.Format;
-                                
-                                uint8_t* dst = pPixelData;
-                                uint8_t* src = (uint8_t*)mapped.pData;
-                                uint32_t bytesPerRow = desc.Width * 4;
-                                
-                                for(uint32_t y = 0; y < desc.Height; ++y) {
-                                    memcpy(dst + y * bytesPerRow, src + y * mapped.RowPitch, bytesPerRow);
-                                }
-                                
-                                pHeader->sequenceNumber = ++frameSeq;
+                    if (pContext) {
+                        ID3D11Multithread* pMt = nullptr;
+                        pContext->QueryInterface(__uuidof(ID3D11Multithread), (void**)&pMt);
+                        if (pMt) pMt->Enter();
+
+                        bool needsRecreate = false;
+                        if (pStagingTexture) {
+                            D3D11_TEXTURE2D_DESC existingDesc;
+                            pStagingTexture->GetDesc(&existingDesc);
+                            if (existingDesc.Width != desc.Width || existingDesc.Height != desc.Height || existingDesc.Format != desc.Format) {
+                                pStagingTexture->Release();
+                                pStagingTexture = nullptr;
                             }
-                            pContext->Unmap(pStagingTexture, 0);
                         }
+
+                        if (!pStagingTexture) {
+                            D3D11_TEXTURE2D_DESC stDesc = desc;
+                            stDesc.Usage = D3D11_USAGE_STAGING;
+                            stDesc.BindFlags = 0;
+                            stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                            stDesc.MiscFlags = 0;
+                            pDevice->CreateTexture2D(&stDesc, nullptr, &pStagingTexture);
+                        }
+                        
+                        if (pStagingTexture) {
+                            pContext->CopyResource(pStagingTexture, pGameTex);
+                            
+                            D3D11_MAPPED_SUBRESOURCE mapped;
+                            if (SUCCEEDED(pContext->Map(pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped))) {
+                                    float uMin = pBounds ? pBounds->uMin : 0.0f;
+                                    float vMin = pBounds ? pBounds->vMin : 0.0f;
+                                    float uMax = pBounds ? pBounds->uMax : 1.0f;
+                                    float vMax = pBounds ? pBounds->vMax : 1.0f;
+                                    
+                                    // Sometimes SteamVR passes inverted v bounds
+                                    if (vMin > vMax) {
+                                        float tmp = vMin; vMin = vMax; vMax = tmp;
+                                    }
+                                    if (uMin > uMax) {
+                                        float tmp = uMin; uMin = uMax; uMax = tmp;
+                                    }
+                                    
+                                    uint32_t srcWidth = (uint32_t)(desc.Width * (uMax - uMin));
+                                    uint32_t srcHeight = (uint32_t)(desc.Height * (vMax - vMin));
+                                    uint32_t srcX = (uint32_t)(desc.Width * uMin);
+                                    uint32_t srcY = (uint32_t)(desc.Height * vMin);
+                                    
+                                    if (pHeader && pPixelData) {
+                                        pHeader->width = srcWidth * 2;
+                                        pHeader->height = srcHeight;
+                                        pHeader->format = desc.Format;
+                                    }
+                                    
+                                    uint32_t copyWidth = (srcWidth > 4096) ? 4096 : srcWidth;
+                                    uint32_t copyHeight = (srcHeight > 4096) ? 4096 : srcHeight;
+                                    
+                                    uint8_t* dst = pPixelData;
+                                    uint8_t* src = ((uint8_t*)mapped.pData) + srcY * mapped.RowPitch + srcX * 4;
+                                    
+                                    if (eEye == vr::Eye_Left) {
+                                        for(uint32_t y=0; y<copyHeight; ++y) {
+                                            memcpy(dst + y * (copyWidth * 2) * 4, src + y * mapped.RowPitch, copyWidth * 4);
+                                        }
+                                    } else {
+                                        // Right eye mapped next to it
+                                        for(uint32_t y=0; y<copyHeight; ++y) {
+                                            memcpy(dst + y * (copyWidth * 2) * 4 + copyWidth * 4, src + y * mapped.RowPitch, copyWidth * 4);
+                                        }
+                                    }
+                                    
+                                    if (eEye == vr::Eye_Right) {
+                                        pHeader->sequenceNumber = ++frameSeq;
+                                    }
+                                    pContext->Unmap(pStagingTexture, 0);
+                                }
+                            }
+                        if (pMt) { pMt->Leave(); pMt->Release(); }
+                        pContext->Release();
                     }
-                    pContext->Release();
+                    pDevice->Release();
                 }
-                pDevice->Release();
             }
         }
         return vr::VRCompositorError_None;
@@ -1346,7 +1637,7 @@ public:
     }
     virtual EVRCompositorError SetSkyboxOverride(VR_ARRAY_COUNT( unTextureCount ) const Texture_t *pTextures, uint32_t unTextureCount) override {
         LogMsg("Called: IVRCompositor::SetSkyboxOverride\n");
-        return (EVRCompositorError)1;
+        return vr::VRCompositorError_None;
     }
     virtual void ClearSkyboxOverride() override {
         LogMsg("Called: IVRCompositor::ClearSkyboxOverride\n");
@@ -1454,7 +1745,7 @@ public:
     }
     virtual EVRCompositorError SetStageOverride_Async(const char *pchRenderModelPath, const HmdMatrix34_t *pTransform = 0, const Compositor_StageRenderSettings *pRenderSettings = 0, uint32_t nSizeOfRenderSettings = 0) override {
         LogMsg("Called: IVRCompositor::SetStageOverride_Async\n");
-        return (EVRCompositorError)1;
+        return vr::VRCompositorError_None;
     }
     virtual void ClearStageOverride() override {
         LogMsg("Called: IVRCompositor::ClearStageOverride\n");
@@ -1823,31 +2114,35 @@ class Mock_IVROverlay : public vr::IVROverlay {
 public:
     virtual EVROverlayError FindOverlay(const char *pchOverlayKey, VROverlayHandle_t * pOverlayHandle) override {
         LogMsg("Called: IVROverlay::FindOverlay\n");
-        return vr::VROverlayError_UnknownOverlay;
+        if (pOverlayHandle) *pOverlayHandle = 100;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError CreateOverlay(const char *pchOverlayKey, const char *pchOverlayName, VROverlayHandle_t * pOverlayHandle) override {
         LogMsg("Called: IVROverlay::CreateOverlay\n");
-        return vr::VROverlayError_UnknownOverlay;
+        if (pOverlayHandle) *pOverlayHandle = 100;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError DestroyOverlay(VROverlayHandle_t ulOverlayHandle) override {
         LogMsg("Called: IVROverlay::DestroyOverlay\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual uint32_t GetOverlayKey(VROverlayHandle_t ulOverlayHandle, VR_OUT_STRING() char *pchValue, uint32_t unBufferSize, EVROverlayError *pError = 0L) override {
         LogMsg("Called: IVROverlay::GetOverlayKey\n");
+        if (pchValue && unBufferSize > 0) pchValue[0] = '\0';
         return (uint32_t)0;
     }
     virtual uint32_t GetOverlayName(VROverlayHandle_t ulOverlayHandle, VR_OUT_STRING() char *pchValue, uint32_t unBufferSize, EVROverlayError *pError = 0L) override {
         LogMsg("Called: IVROverlay::GetOverlayName\n");
+        if (pchValue && unBufferSize > 0) pchValue[0] = '\0';
         return (uint32_t)0;
     }
     virtual EVROverlayError SetOverlayName(VROverlayHandle_t ulOverlayHandle, const char *pchName) override {
         LogMsg("Called: IVROverlay::SetOverlayName\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayImageData(VROverlayHandle_t ulOverlayHandle, void *pvBuffer, uint32_t unBufferSize, uint32_t *punWidth, uint32_t *punHeight) override {
         LogMsg("Called: IVROverlay::GetOverlayImageData\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual const char * GetOverlayErrorNameFromEnum(EVROverlayError error) override {
         LogMsg("Called: IVROverlay::GetOverlayErrorNameFromEnum\n");
@@ -1855,7 +2150,7 @@ public:
     }
     virtual EVROverlayError SetOverlayRenderingPid(VROverlayHandle_t ulOverlayHandle, uint32_t unPID) override {
         LogMsg("Called: IVROverlay::SetOverlayRenderingPid\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual uint32_t GetOverlayRenderingPid(VROverlayHandle_t ulOverlayHandle) override {
         LogMsg("Called: IVROverlay::GetOverlayRenderingPid\n");
@@ -1863,131 +2158,132 @@ public:
     }
     virtual EVROverlayError SetOverlayFlag(VROverlayHandle_t ulOverlayHandle, VROverlayFlags eOverlayFlag, bool bEnabled) override {
         LogMsg("Called: IVROverlay::SetOverlayFlag\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayFlag(VROverlayHandle_t ulOverlayHandle, VROverlayFlags eOverlayFlag, bool *pbEnabled) override {
         LogMsg("Called: IVROverlay::GetOverlayFlag\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayFlags(VROverlayHandle_t ulOverlayHandle, uint32_t *pFlags) override {
         LogMsg("Called: IVROverlay::GetOverlayFlags\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayColor(VROverlayHandle_t ulOverlayHandle, float fRed, float fGreen, float fBlue) override {
         LogMsg("Called: IVROverlay::SetOverlayColor\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayColor(VROverlayHandle_t ulOverlayHandle, float *pfRed, float *pfGreen, float *pfBlue) override {
         LogMsg("Called: IVROverlay::GetOverlayColor\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayAlpha(VROverlayHandle_t ulOverlayHandle, float fAlpha) override {
         LogMsg("Called: IVROverlay::SetOverlayAlpha\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayAlpha(VROverlayHandle_t ulOverlayHandle, float *pfAlpha) override {
         LogMsg("Called: IVROverlay::GetOverlayAlpha\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayTexelAspect(VROverlayHandle_t ulOverlayHandle, float fTexelAspect) override {
         LogMsg("Called: IVROverlay::SetOverlayTexelAspect\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayTexelAspect(VROverlayHandle_t ulOverlayHandle, float *pfTexelAspect) override {
         LogMsg("Called: IVROverlay::GetOverlayTexelAspect\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlaySortOrder(VROverlayHandle_t ulOverlayHandle, uint32_t unSortOrder) override {
         LogMsg("Called: IVROverlay::SetOverlaySortOrder\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlaySortOrder(VROverlayHandle_t ulOverlayHandle, uint32_t *punSortOrder) override {
         LogMsg("Called: IVROverlay::GetOverlaySortOrder\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayWidthInMeters(VROverlayHandle_t ulOverlayHandle, float fWidthInMeters) override {
         LogMsg("Called: IVROverlay::SetOverlayWidthInMeters\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayWidthInMeters(VROverlayHandle_t ulOverlayHandle, float *pfWidthInMeters) override {
         LogMsg("Called: IVROverlay::GetOverlayWidthInMeters\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayCurvature(VROverlayHandle_t ulOverlayHandle, float fCurvature) override {
         LogMsg("Called: IVROverlay::SetOverlayCurvature\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayCurvature(VROverlayHandle_t ulOverlayHandle, float *pfCurvature) override {
         LogMsg("Called: IVROverlay::GetOverlayCurvature\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayTextureColorSpace(VROverlayHandle_t ulOverlayHandle, EColorSpace eTextureColorSpace) override {
         LogMsg("Called: IVROverlay::SetOverlayTextureColorSpace\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayTextureColorSpace(VROverlayHandle_t ulOverlayHandle, EColorSpace *peTextureColorSpace) override {
         LogMsg("Called: IVROverlay::GetOverlayTextureColorSpace\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayTextureBounds(VROverlayHandle_t ulOverlayHandle, const VRTextureBounds_t *pOverlayTextureBounds) override {
         LogMsg("Called: IVROverlay::SetOverlayTextureBounds\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayTextureBounds(VROverlayHandle_t ulOverlayHandle, VRTextureBounds_t *pOverlayTextureBounds) override {
         LogMsg("Called: IVROverlay::GetOverlayTextureBounds\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayTransformType(VROverlayHandle_t ulOverlayHandle, VROverlayTransformType *peTransformType) override {
         LogMsg("Called: IVROverlay::GetOverlayTransformType\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayTransformAbsolute(VROverlayHandle_t ulOverlayHandle, ETrackingUniverseOrigin eTrackingOrigin, const HmdMatrix34_t *pmatTrackingOriginToOverlayTransform) override {
         LogMsg("Called: IVROverlay::SetOverlayTransformAbsolute\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayTransformAbsolute(VROverlayHandle_t ulOverlayHandle, ETrackingUniverseOrigin *peTrackingOrigin, HmdMatrix34_t *pmatTrackingOriginToOverlayTransform) override {
         LogMsg("Called: IVROverlay::GetOverlayTransformAbsolute\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayTransformTrackedDeviceRelative(VROverlayHandle_t ulOverlayHandle, TrackedDeviceIndex_t unTrackedDevice, const HmdMatrix34_t *pmatTrackedDeviceToOverlayTransform) override {
         LogMsg("Called: IVROverlay::SetOverlayTransformTrackedDeviceRelative\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayTransformTrackedDeviceRelative(VROverlayHandle_t ulOverlayHandle, TrackedDeviceIndex_t *punTrackedDevice, HmdMatrix34_t *pmatTrackedDeviceToOverlayTransform) override {
         LogMsg("Called: IVROverlay::GetOverlayTransformTrackedDeviceRelative\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayTransformTrackedDeviceComponent(VROverlayHandle_t ulOverlayHandle, TrackedDeviceIndex_t unDeviceIndex, const char *pchComponentName) override {
         LogMsg("Called: IVROverlay::SetOverlayTransformTrackedDeviceComponent\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayTransformTrackedDeviceComponent(VROverlayHandle_t ulOverlayHandle, TrackedDeviceIndex_t *punDeviceIndex, VR_OUT_STRING() char *pchComponentName, uint32_t unComponentNameSize) override {
         LogMsg("Called: IVROverlay::GetOverlayTransformTrackedDeviceComponent\n");
-        return vr::VROverlayError_UnknownOverlay;
+        if (pchComponentName && unComponentNameSize > 0) pchComponentName[0] = '\0';
+        return vr::VROverlayError_None;
     }
     virtual vr::EVROverlayError GetOverlayTransformOverlayRelative(VROverlayHandle_t ulOverlayHandle, VROverlayHandle_t *ulOverlayHandleParent, HmdMatrix34_t *pmatParentOverlayToOverlayTransform) override {
         LogMsg("Called: IVROverlay::GetOverlayTransformOverlayRelative\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual vr::EVROverlayError SetOverlayTransformOverlayRelative(VROverlayHandle_t ulOverlayHandle, VROverlayHandle_t ulOverlayHandleParent, const HmdMatrix34_t *pmatParentOverlayToOverlayTransform) override {
         LogMsg("Called: IVROverlay::SetOverlayTransformOverlayRelative\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayTransformCursor(VROverlayHandle_t ulCursorOverlayHandle, const HmdVector2_t *pvHotspot) override {
         LogMsg("Called: IVROverlay::SetOverlayTransformCursor\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual vr::EVROverlayError GetOverlayTransformCursor(VROverlayHandle_t ulOverlayHandle, HmdVector2_t *pvHotspot) override {
         LogMsg("Called: IVROverlay::GetOverlayTransformCursor\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError ShowOverlay(VROverlayHandle_t ulOverlayHandle) override {
         LogMsg("Called: IVROverlay::ShowOverlay\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError HideOverlay(VROverlayHandle_t ulOverlayHandle) override {
         LogMsg("Called: IVROverlay::HideOverlay\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual bool IsOverlayVisible(VROverlayHandle_t ulOverlayHandle) override {
         LogMsg("Called: IVROverlay::IsOverlayVisible\n");
@@ -1995,7 +2291,7 @@ public:
     }
     virtual EVROverlayError GetTransformForOverlayCoordinates(VROverlayHandle_t ulOverlayHandle, ETrackingUniverseOrigin eTrackingOrigin, HmdVector2_t coordinatesInOverlay, HmdMatrix34_t *pmatTransform) override {
         LogMsg("Called: IVROverlay::GetTransformForOverlayCoordinates\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual bool PollNextOverlayEvent(VROverlayHandle_t ulOverlayHandle, VREvent_t *pEvent, uint32_t uncbVREvent) override {
         LogMsg("Called: IVROverlay::PollNextOverlayEvent\n");
@@ -2003,19 +2299,19 @@ public:
     }
     virtual EVROverlayError GetOverlayInputMethod(VROverlayHandle_t ulOverlayHandle, VROverlayInputMethod *peInputMethod) override {
         LogMsg("Called: IVROverlay::GetOverlayInputMethod\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayInputMethod(VROverlayHandle_t ulOverlayHandle, VROverlayInputMethod eInputMethod) override {
         LogMsg("Called: IVROverlay::SetOverlayInputMethod\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayMouseScale(VROverlayHandle_t ulOverlayHandle, HmdVector2_t *pvecMouseScale) override {
         LogMsg("Called: IVROverlay::GetOverlayMouseScale\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayMouseScale(VROverlayHandle_t ulOverlayHandle, const HmdVector2_t *pvecMouseScale) override {
         LogMsg("Called: IVROverlay::SetOverlayMouseScale\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual bool ComputeOverlayIntersection(VROverlayHandle_t ulOverlayHandle, const VROverlayIntersectionParams_t *pParams, VROverlayIntersectionResults_t *pResults) override {
         LogMsg("Called: IVROverlay::ComputeOverlayIntersection\n");
@@ -2027,55 +2323,57 @@ public:
     }
     virtual EVROverlayError SetOverlayIntersectionMask(VROverlayHandle_t ulOverlayHandle, VROverlayIntersectionMaskPrimitive_t *pMaskPrimitives, uint32_t unNumMaskPrimitives, uint32_t unPrimitiveSize = sizeof( VROverlayIntersectionMaskPrimitive_t )) override {
         LogMsg("Called: IVROverlay::SetOverlayIntersectionMask\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError TriggerLaserMouseHapticVibration(VROverlayHandle_t ulOverlayHandle, float fDurationSeconds, float fFrequency, float fAmplitude) override {
         LogMsg("Called: IVROverlay::TriggerLaserMouseHapticVibration\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayCursor(VROverlayHandle_t ulOverlayHandle, VROverlayHandle_t ulCursorHandle) override {
         LogMsg("Called: IVROverlay::SetOverlayCursor\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayCursorPositionOverride(VROverlayHandle_t ulOverlayHandle, const HmdVector2_t *pvCursor) override {
         LogMsg("Called: IVROverlay::SetOverlayCursorPositionOverride\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError ClearOverlayCursorPositionOverride(VROverlayHandle_t ulOverlayHandle) override {
         LogMsg("Called: IVROverlay::ClearOverlayCursorPositionOverride\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayTexture(VROverlayHandle_t ulOverlayHandle, const Texture_t *pTexture) override {
         LogMsg("Called: IVROverlay::SetOverlayTexture\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError ClearOverlayTexture(VROverlayHandle_t ulOverlayHandle) override {
         LogMsg("Called: IVROverlay::ClearOverlayTexture\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayRaw(VROverlayHandle_t ulOverlayHandle, void *pvBuffer, uint32_t unWidth, uint32_t unHeight, uint32_t unBytesPerPixel) override {
         LogMsg("Called: IVROverlay::SetOverlayRaw\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError SetOverlayFromFile(VROverlayHandle_t ulOverlayHandle, const char *pchFilePath) override {
         LogMsg("Called: IVROverlay::SetOverlayFromFile\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayTexture(VROverlayHandle_t ulOverlayHandle, void **pNativeTextureHandle, void *pNativeTextureRef, uint32_t *pWidth, uint32_t *pHeight, uint32_t *pNativeFormat, ETextureType *pAPIType, EColorSpace *pColorSpace, VRTextureBounds_t *pTextureBounds) override {
         LogMsg("Called: IVROverlay::GetOverlayTexture\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError ReleaseNativeOverlayHandle(VROverlayHandle_t ulOverlayHandle, void *pNativeTextureHandle) override {
         LogMsg("Called: IVROverlay::ReleaseNativeOverlayHandle\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetOverlayTextureSize(VROverlayHandle_t ulOverlayHandle, uint32_t *pWidth, uint32_t *pHeight) override {
         LogMsg("Called: IVROverlay::GetOverlayTextureSize\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError CreateDashboardOverlay(const char *pchOverlayKey, const char *pchOverlayFriendlyName, VROverlayHandle_t * pMainHandle, VROverlayHandle_t *pThumbnailHandle) override {
         LogMsg("Called: IVROverlay::CreateDashboardOverlay\n");
-        return vr::VROverlayError_UnknownOverlay;
+        if (pMainHandle) *pMainHandle = 101;
+        if (pThumbnailHandle) *pThumbnailHandle = 102;
+        return vr::VROverlayError_None;
     }
     virtual bool IsDashboardVisible() override {
         LogMsg("Called: IVROverlay::IsDashboardVisible\n");
@@ -2087,11 +2385,11 @@ public:
     }
     virtual EVROverlayError SetDashboardOverlaySceneProcess(VROverlayHandle_t ulOverlayHandle, uint32_t unProcessId) override {
         LogMsg("Called: IVROverlay::SetDashboardOverlaySceneProcess\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError GetDashboardOverlaySceneProcess(VROverlayHandle_t ulOverlayHandle, uint32_t *punProcessId) override {
         LogMsg("Called: IVROverlay::GetDashboardOverlaySceneProcess\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual void ShowDashboard(const char *pchOverlayToShow) override {
         LogMsg("Called: IVROverlay::ShowDashboard\n");
@@ -2102,14 +2400,15 @@ public:
     }
     virtual EVROverlayError ShowKeyboard(EGamepadTextInputMode eInputMode, EGamepadTextInputLineMode eLineInputMode, uint32_t unFlags, const char *pchDescription, uint32_t unCharMax, const char *pchExistingText, uint64_t uUserValue) override {
         LogMsg("Called: IVROverlay::ShowKeyboard\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError ShowKeyboardForOverlay(VROverlayHandle_t ulOverlayHandle, EGamepadTextInputMode eInputMode, EGamepadTextInputLineMode eLineInputMode, uint32_t unFlags, const char *pchDescription, uint32_t unCharMax, const char *pchExistingText, uint64_t uUserValue) override {
         LogMsg("Called: IVROverlay::ShowKeyboardForOverlay\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual uint32_t GetKeyboardText(VR_OUT_STRING() char *pchText, uint32_t cchText) override {
         LogMsg("Called: IVROverlay::GetKeyboardText\n");
+        if (pchText && cchText > 0) pchText[0] = '\0';
         return (uint32_t)0;
     }
     virtual void HideKeyboard() override {
@@ -2234,11 +2533,14 @@ class Mock_IVROverlayView : public vr::IVROverlayView {
 public:
     virtual EVROverlayError AcquireOverlayView(VROverlayHandle_t ulOverlayHandle, VRNativeDevice_t *pNativeDevice, VROverlayView_t *pOverlayView, uint32_t unOverlayViewSize) override {
         LogMsg("Called: IVROverlayView::AcquireOverlayView\n");
-        return vr::VROverlayError_UnknownOverlay;
+        if (pOverlayView && unOverlayViewSize >= sizeof(VROverlayView_t)) {
+            memset(pOverlayView, 0, unOverlayViewSize);
+        }
+        return vr::VROverlayError_None;
     }
     virtual EVROverlayError ReleaseOverlayView(VROverlayView_t *pOverlayView) override {
         LogMsg("Called: IVROverlayView::ReleaseOverlayView\n");
-        return vr::VROverlayError_UnknownOverlay;
+        return vr::VROverlayError_None;
     }
     virtual void PostOverlayEvent(VROverlayHandle_t ulOverlayHandle, const VREvent_t *pvrEvent) override {
         LogMsg("Called: IVROverlayView::PostOverlayEvent\n");
@@ -2353,6 +2655,7 @@ class Mock_IVRRenderModels : public vr::IVRRenderModels {
 public:
     virtual EVRRenderModelError LoadRenderModel_Async(const char *pchRenderModelName, RenderModel_t **ppRenderModel) override {
         LogMsg("Called: IVRRenderModels::LoadRenderModel_Async\n");
+        if (ppRenderModel) *ppRenderModel = nullptr;
         return vr::VRRenderModelError_NotSupported;
     }
     virtual void FreeRenderModel(RenderModel_t *pRenderModel) override {
@@ -2939,8 +3242,35 @@ public:
         return (uint32_t)0;
     }
     virtual uint32_t GetResourceFullPath(const char *pchResourceName, const char *pchResourceTypeDirectory, VR_OUT_STRING() char *pchPathBuffer, uint32_t unBufferLen) override {
-        LogMsg("Called: IVRResources::GetResourceFullPath\n");
-        return (uint32_t)0;
+        char msg[512];
+        snprintf(msg, sizeof(msg), "Called: IVRResources::GetResourceFullPath: %s\n", pchResourceName ? pchResourceName : "null");
+        LogMsg(msg);
+        
+        if (!pchResourceName) return 0;
+        
+        std::string resName(pchResourceName);
+        std::string fullPath = "";
+        
+        std::string baseIndex = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SteamVR\\drivers\\indexcontroller\\resources";
+        std::string baseSteamVR = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SteamVR\\resources";
+        
+        if (resName.find("{indexcontroller}") == 0) {
+            fullPath = baseIndex + resName.substr(17);
+        } else if (resName.find("{steamvr}") == 0) {
+            fullPath = baseSteamVR + resName.substr(9);
+        } else {
+            fullPath = resName;
+        }
+        
+        for (int i = 0; i < fullPath.length(); ++i) {
+            if (fullPath[i] == '/') fullPath[i] = '\\';
+        }
+        
+        if (pchPathBuffer && unBufferLen > fullPath.length()) {
+            strcpy(pchPathBuffer, fullPath.c_str());
+            return fullPath.length() + 1;
+        }
+        return fullPath.length() + 1;
     }
     virtual void* DummyPadding0() { return nullptr; }
     virtual void* DummyPadding1() { return nullptr; }
@@ -3164,22 +3494,30 @@ public:
     virtual void* DummyPadding99() { return nullptr; }
 } g_mockDriverManager;
 
+static std::map<vr::VRActionHandle_t, std::string> g_actionNames;
+
 class Mock_IVRInput : public vr::IVRInput {
 public:
     virtual EVRInputError SetActionManifestPath(const char *pchActionManifestPath) override {
         LogMsg("Called: IVRInput::SetActionManifestPath\n");
-        return vr::VRInputError_InvalidHandle;
+        return vr::VRInputError_None;
     }
     virtual EVRInputError GetActionSetHandle(const char *pchActionSetName, VRActionSetHandle_t *pHandle) override {
         LogMsg("Called: IVRInput::GetActionSetHandle\n");
-        static uint64_t nextSetHandle = 1000;
+        static uint64_t nextSetHandle = 100;
         if(pHandle) *pHandle = nextSetHandle++;
         return vr::VRInputError_None;
     }
+    
     virtual EVRInputError GetActionHandle(const char *pchActionName, VRActionHandle_t *pHandle) override {
-        LogMsg("Called: IVRInput::GetActionHandle\n");
         static uint64_t nextHandle = 10;
-        if(pHandle) { *pHandle = nextHandle++; }
+        if(pHandle) { 
+            *pHandle = nextHandle++; 
+            if (pchActionName) g_actionNames[*pHandle] = pchActionName;
+            char buf[256];
+            snprintf(buf, sizeof(buf), "GetActionHandle: %s -> %llu\n", pchActionName, *pHandle);
+            LogMsg(buf);
+        }
         return vr::VRInputError_None;
     }
     virtual EVRInputError GetInputSourceHandle(const char *pchInputSourcePath, VRInputValueHandle_t *pHandle) override {
@@ -3189,183 +3527,289 @@ public:
         return vr::VRInputError_None;
     }
     virtual EVRInputError UpdateActionState(VR_ARRAY_COUNT( unSetCount ) VRActiveActionSet_t *pSets, uint32_t unSizeOfVRSelectedActionSet_t, uint32_t unSetCount) override {
-        LogMsg("Called: IVRInput::UpdateActionState\n");
         return vr::VRInputError_None;
     }
     virtual EVRInputError GetDigitalActionData(VRActionHandle_t action, InputDigitalActionData_t *pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice) override {
-        LogMsg("Called: IVRInput::GetDigitalActionData\n");
         if(pActionData && unActionDataSize > 0) {
             vr::InputDigitalActionData_t temp = {0};
             temp.bActive = true;
             if (pSharedHands) {
                 bool pressed = false;
-                if (ulRestrictToDevice == 1) pressed = pSharedHands->leftPinch;
-                else if (ulRestrictToDevice == 2) pressed = pSharedHands->rightPinch;
-                else pressed = pSharedHands->leftPinch || pSharedHands->rightPinch;
+                uint64_t origin = ulRestrictToDevice;
+                if (origin == 0) origin = 2;
+                
+                std::string name = g_actionNames[action];
+                
+                static bool leftGripToggle = false;
+                static bool rightGripToggle = false;
+                static uint32_t lastLeftBtns = 0;
+                static uint32_t lastRightBtns = 0;
+                
+                uint32_t lb = pSharedHands->leftButtons;
+                uint32_t rb = pSharedHands->rightButtons;
+                
+                if ((lb & (1<<7)) && !(lastLeftBtns & (1<<7))) leftGripToggle = !leftGripToggle;
+                if ((lb & (1<<8)) && !(lastLeftBtns & (1<<8))) leftGripToggle = !leftGripToggle;
+                if ((rb & (1<<5)) && !(lastRightBtns & (1<<5))) rightGripToggle = !rightGripToggle;
+                if ((rb & (1<<6)) && !(lastRightBtns & (1<<6))) rightGripToggle = !rightGripToggle;
+                
+                lastLeftBtns = lb;
+                lastRightBtns = rb;
+                
+                if (name.find("Interact") != std::string::npos || name.find("Use") != std::string::npos) {
+                    if (origin == 1) pressed = pSharedHands->leftPinch || leftGripToggle || ((lb & (1<<4)) != 0) || ((lb & (1<<0)) != 0);
+                    else pressed = pSharedHands->rightPinch || rightGripToggle || ((rb & (1<<2)) != 0) || ((rb & (1<<0)) != 0);
+                }
+                else if (name.find("GrabGrip") != std::string::npos || 
+                    name.find("GrabPinch") != std::string::npos ||
+                    name.find("Pinch") != std::string::npos ||
+                    name.find("Grip") != std::string::npos ||
+                    name.find("Grab") != std::string::npos) {
+                    if (origin == 1) pressed = pSharedHands->leftPinch || leftGripToggle;
+                    else pressed = pSharedHands->rightPinch || rightGripToggle;
+                }
+                else if (name.find("Trigger") != std::string::npos || name.find("Fire") != std::string::npos) {
+                    if (origin == 1) pressed = (lb & (1<<4)) != 0;
+                    else pressed = (rb & (1<<2)) != 0;
+                }
+                else if (name.find("Teleport") != std::string::npos) {
+                    if (origin == 2) pressed = (rb & (1<<3)) != 0;
+                    else pressed = (lb & (1<<5)) != 0;
+                }
+                else if (name.find("a_button") != std::string::npos || name.find("AButton") != std::string::npos) {
+                    if (origin == 2) pressed = (rb & (1<<0)) != 0;
+                }
+                else if (name.find("b_button") != std::string::npos || name.find("BButton") != std::string::npos) {
+                    if (origin == 2) pressed = (rb & (1<<1)) != 0;
+                }
+                else if (name.find("Pause") != std::string::npos || name.find("System") != std::string::npos || name.find("Menu") != std::string::npos) {
+                    if (origin == 2) pressed = (rb & (1<<4)) != 0;
+                    else pressed = (lb & (1<<6)) != 0;
+                }
+                
+                static std::map<std::pair<VRActionHandle_t, uint64_t>, bool> s_lastState;
+                std::pair<VRActionHandle_t, uint64_t> key = {action, origin};
                 temp.bState = pressed;
+                temp.bChanged = (s_lastState[key] != pressed);
+                temp.activeOrigin = origin;
+                temp.fUpdateTime = (float)GetTickCount() / 1000.0f;
+                s_lastState[key] = pressed;
+                
+                if (temp.bChanged || temp.bState) {
+                    char msg[256];
+                    snprintf(msg, 256, "Action '%s' (origin=%llu): bState=%d, bChanged=%d\n", name.c_str(), origin, temp.bState, temp.bChanged);
+                    LogMsg(msg);
+                }
             }
             memcpy(pActionData, &temp, unActionDataSize > sizeof(temp) ? sizeof(temp) : unActionDataSize);
         }
         return vr::VRInputError_None;
     }
     virtual EVRInputError GetAnalogActionData(VRActionHandle_t action, InputAnalogActionData_t *pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice) override {
-        LogMsg("Called: IVRInput::GetAnalogActionData\n");
         if(pActionData && unActionDataSize > 0) {
             vr::InputAnalogActionData_t temp = {0};
             temp.bActive = true;
+            if (pSharedHands) {
+                float x = 0.0f;
+                float y = 0.0f;
+                uint64_t origin = ulRestrictToDevice;
+                if (origin == 0) origin = 2;
+
+                std::string name = g_actionNames[action];
+                uint32_t lb = pSharedHands->leftButtons;
+                uint32_t rb = pSharedHands->rightButtons;
+
+                if (name.find("Move") != std::string::npos || name.find("Trackpad") != std::string::npos || name.find("Thumbstick") != std::string::npos || name.find("Turn") != std::string::npos || name.find("Scroll") != std::string::npos) {
+                    if (origin == 1) {
+                        x = pSharedHands->leftStickX;
+                        y = -pSharedHands->leftStickY;
+                    } else {
+                        x = pSharedHands->rightStickX;
+                        y = -pSharedHands->rightStickY;
+                    }
+                }
+                else if (name.find("Trigger") != std::string::npos || name.find("Pull") != std::string::npos || name.find("Pinch") != std::string::npos || name.find("Use") != std::string::npos) {
+                    if (origin == 1) x = (lb & (1<<4)) ? 1.0f : 0.0f;
+                    else x = (rb & (1<<2)) ? 1.0f : 0.0f;
+                }
+                
+                static std::map<std::pair<VRActionHandle_t, uint64_t>, std::pair<float, float>> s_lastAnalog;
+                std::pair<VRActionHandle_t, uint64_t> key = {action, origin};
+                float lastX = s_lastAnalog[key].first;
+                float lastY = s_lastAnalog[key].second;
+                
+                temp.x = x;
+                temp.y = y;
+                temp.deltaX = x - lastX;
+                temp.deltaY = y - lastY;
+                temp.activeOrigin = origin;
+                temp.fUpdateTime = (float)GetTickCount() / 1000.0f;
+                
+                s_lastAnalog[key] = {x, y};
+            }
             memcpy(pActionData, &temp, unActionDataSize > sizeof(temp) ? sizeof(temp) : unActionDataSize);
         }
         return vr::VRInputError_None;
     }
     virtual EVRInputError GetPoseActionDataRelativeToNow(VRActionHandle_t action, ETrackingUniverseOrigin eOrigin, float fPredictedSecondsFromNow, InputPoseActionData_t *pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice) override {
-        LogMsg("Called: IVRInput::GetPoseActionDataRelativeToNow\n");
         if(pActionData && unActionDataSize > 0) {
             vr::InputPoseActionData_t temp = {0};
             temp.bActive = true;
             temp.pose.bPoseIsValid = true;
             temp.pose.bDeviceIsConnected = true;
             temp.pose.eTrackingResult = vr::TrackingResult_Running_OK;
-            temp.pose.mDeviceToAbsoluteTracking.m[0][0] = 1; temp.pose.mDeviceToAbsoluteTracking.m[1][1] = 1; temp.pose.mDeviceToAbsoluteTracking.m[2][2] = 1;
+            uint64_t origin = ulRestrictToDevice;
+            if (origin == 0) origin = 2;
+            temp.activeOrigin = origin;
+            if (origin == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
+                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->leftTransform[c*4 + r];
+                temp.pose.vVelocity.v[0] = g_handVelocityL[0]; temp.pose.vVelocity.v[1] = g_handVelocityL[1]; temp.pose.vVelocity.v[2] = g_handVelocityL[2];
+            } else if (origin == 2 && pSharedHands && pSharedHands->rightTransform[0] != 0.0f) {
+                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->rightTransform[c*4 + r];
+                temp.pose.vVelocity.v[0] = g_handVelocityR[0]; temp.pose.vVelocity.v[1] = g_handVelocityR[1]; temp.pose.vVelocity.v[2] = g_handVelocityR[2];
+            } else {
+                temp.pose.mDeviceToAbsoluteTracking.m[0][0] = 1; temp.pose.mDeviceToAbsoluteTracking.m[1][1] = 1; temp.pose.mDeviceToAbsoluteTracking.m[2][2] = 1;
+            }
             memcpy(pActionData, &temp, unActionDataSize > sizeof(temp) ? sizeof(temp) : unActionDataSize);
         }
         return vr::VRInputError_None;
     }
     virtual EVRInputError GetPoseActionDataForNextFrame(VRActionHandle_t action, ETrackingUniverseOrigin eOrigin, InputPoseActionData_t *pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice) override {
-        LogMsg("Called: IVRInput::GetPoseActionDataForNextFrame\n");
         if(pActionData && unActionDataSize > 0) {
             vr::InputPoseActionData_t temp = {0};
             temp.bActive = true;
             temp.pose.bPoseIsValid = true;
             temp.pose.bDeviceIsConnected = true;
             temp.pose.eTrackingResult = vr::TrackingResult_Running_OK;
-            temp.pose.mDeviceToAbsoluteTracking.m[0][0] = 1; temp.pose.mDeviceToAbsoluteTracking.m[1][1] = 1; temp.pose.mDeviceToAbsoluteTracking.m[2][2] = 1;
+            uint64_t origin = ulRestrictToDevice;
+            if (origin == 0) origin = 2;
+            temp.activeOrigin = origin;
+            if (origin == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
+                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->leftTransform[c*4 + r];
+                temp.pose.vVelocity.v[0] = g_handVelocityL[0]; temp.pose.vVelocity.v[1] = g_handVelocityL[1]; temp.pose.vVelocity.v[2] = g_handVelocityL[2];
+            } else if (origin == 2 && pSharedHands && pSharedHands->rightTransform[0] != 0.0f) {
+                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->rightTransform[c*4 + r];
+                temp.pose.vVelocity.v[0] = g_handVelocityR[0]; temp.pose.vVelocity.v[1] = g_handVelocityR[1]; temp.pose.vVelocity.v[2] = g_handVelocityR[2];
+            } else {
+                temp.pose.mDeviceToAbsoluteTracking.m[0][0] = 1; temp.pose.mDeviceToAbsoluteTracking.m[1][1] = 1; temp.pose.mDeviceToAbsoluteTracking.m[2][2] = 1;
+            }
             memcpy(pActionData, &temp, unActionDataSize > sizeof(temp) ? sizeof(temp) : unActionDataSize);
         }
         return vr::VRInputError_None;
     }
     virtual EVRInputError GetSkeletalActionData(VRActionHandle_t action, InputSkeletalActionData_t *pActionData, uint32_t unActionDataSize) override {
-        LogMsg("Called: IVRInput::GetSkeletalActionData\n");
-        if(pActionData && unActionDataSize > 0) {
-            vr::InputSkeletalActionData_t temp = {0};
-            temp.bActive = true;
-            temp.activeOrigin = 0;
-            memcpy(pActionData, &temp, unActionDataSize > sizeof(temp) ? sizeof(temp) : unActionDataSize);
+        if (pActionData && unActionDataSize >= sizeof(InputSkeletalActionData_t)) {
+            pActionData->bActive = true;
+            pActionData->activeOrigin = 2;
         }
         return vr::VRInputError_None;
     }
     virtual EVRInputError GetDominantHand(ETrackedControllerRole *peDominantHand) override {
-        if (peDominantHand) *peDominantHand = vr::TrackedControllerRole_RightHand;
+        if(peDominantHand) *peDominantHand = vr::TrackedControllerRole_RightHand;
         return vr::VRInputError_None;
     }
     virtual EVRInputError SetDominantHand(ETrackedControllerRole eDominantHand) override {
         return vr::VRInputError_None;
     }
     virtual EVRInputError GetBoneCount(VRActionHandle_t action, uint32_t* pBoneCount) override {
-        if (pBoneCount) *pBoneCount = 31; // Typical hand bone count
+        if(pBoneCount) *pBoneCount = 31;
         return vr::VRInputError_None;
     }
-    virtual EVRInputError GetBoneHierarchy(VRActionHandle_t action, VR_ARRAY_COUNT( unIndexArayCount ) BoneIndex_t* pParentIndices, uint32_t unIndexArayCount) override {
-        if (pParentIndices && unIndexArayCount > 0) memset(pParentIndices, 0, sizeof(BoneIndex_t) * unIndexArayCount);
+    virtual EVRInputError GetBoneHierarchy(VRActionHandle_t action, BoneIndex_t* pParentIndices, uint32_t unIndexArayCount) override {
         return vr::VRInputError_None;
     }
-    virtual EVRInputError GetBoneName(VRActionHandle_t action, BoneIndex_t nBoneIndex, VR_OUT_STRING() char* pchBoneName, uint32_t unNameBufferSize) override {
-        if (pchBoneName && unNameBufferSize > 0) { strncpy(pchBoneName, "Bone", unNameBufferSize); pchBoneName[unNameBufferSize-1] = '\0'; }
+    virtual EVRInputError GetBoneName(VRActionHandle_t action, BoneIndex_t nBoneIndex, char* pchBoneName, uint32_t unNameBufferSize) override {
         return vr::VRInputError_None;
     }
-    virtual EVRInputError GetSkeletalReferenceTransforms(VRActionHandle_t action, EVRSkeletalTransformSpace eTransformSpace, EVRSkeletalReferencePose eReferencePose, VR_ARRAY_COUNT( unTransformArrayCount ) VRBoneTransform_t *pTransformArray, uint32_t unTransformArrayCount) override {
-        LogMsg("Called: IVRInput::GetSkeletalReferenceTransforms\n");
-        if (pTransformArray && unTransformArrayCount > 0) {
-            for (uint32_t i=0; i<unTransformArrayCount; ++i) {
-                pTransformArray[i].position.v[0] = 0; pTransformArray[i].position.v[1] = 0; pTransformArray[i].position.v[2] = 0; pTransformArray[i].position.v[3] = 1;
-                pTransformArray[i].orientation.w = 1; pTransformArray[i].orientation.x = 0; pTransformArray[i].orientation.y = 0; pTransformArray[i].orientation.z = 0;
-            }
-        }
+    virtual EVRInputError GetSkeletalReferenceTransforms(VRActionHandle_t action, EVRSkeletalTransformSpace eTransformSpace, EVRSkeletalReferencePose eReferencePose, VRBoneTransform_t *pTransformArray, uint32_t unTransformArrayCount) override {
         return vr::VRInputError_None;
     }
     virtual EVRInputError GetSkeletalTrackingLevel(VRActionHandle_t action, EVRSkeletalTrackingLevel* pSkeletalTrackingLevel) override {
-        if (pSkeletalTrackingLevel) *pSkeletalTrackingLevel = vr::VRSkeletalTracking_Estimated;
+        if(pSkeletalTrackingLevel) *pSkeletalTrackingLevel = vr::VRSkeletalTracking_Partial;
         return vr::VRInputError_None;
     }
-    virtual EVRInputError GetSkeletalBoneData(VRActionHandle_t action, EVRSkeletalTransformSpace eTransformSpace, EVRSkeletalMotionRange eMotionRange, VR_ARRAY_COUNT( unTransformArrayCount ) VRBoneTransform_t *pTransformArray, uint32_t unTransformArrayCount) override {
-        LogMsg("Called: IVRInput::GetSkeletalBoneData\n");
-        if (pTransformArray && unTransformArrayCount > 0) {
-            for (uint32_t i=0; i<unTransformArrayCount; ++i) {
-                pTransformArray[i].position.v[0] = 0; pTransformArray[i].position.v[1] = 0; pTransformArray[i].position.v[2] = 0; pTransformArray[i].position.v[3] = 1;
-                pTransformArray[i].orientation.w = 1; pTransformArray[i].orientation.x = 0; pTransformArray[i].orientation.y = 0; pTransformArray[i].orientation.z = 0;
+    virtual EVRInputError GetSkeletalBoneData(VRActionHandle_t action, EVRSkeletalTransformSpace eTransformSpace, EVRSkeletalMotionRange eMotionRange, VRBoneTransform_t *pTransformArray, uint32_t unTransformArrayCount) override {
+        return vr::VRInputError_None;
+    }
+    virtual EVRInputError GetSkeletalSummaryData(VRActionHandle_t action, EVRSummaryType eSummaryType, VRSkeletalSummaryData_t * pSkeletalSummaryData) override {
+        return vr::VRInputError_None;
+    }
+    virtual EVRInputError GetSkeletalBoneDataCompressed(VRActionHandle_t action, EVRSkeletalMotionRange eMotionRange, void *pvCompressedData, uint32_t unCompressedSize, uint32_t *punRequiredCompressedSize) override {
+        return vr::VRInputError_None;
+    }
+    virtual EVRInputError DecompressSkeletalBoneData(const void *pvCompressedBuffer, uint32_t unCompressedBufferSize, EVRSkeletalTransformSpace eTransformSpace, VRBoneTransform_t *pTransformArray, uint32_t unTransformArrayCount) override {
+        return vr::VRInputError_None;
+    }
+    virtual EVRInputError TriggerHapticVibrationAction(VRActionHandle_t action, float fStartSecondsFromNow, float fDurationSeconds, float fFrequency, float fAmplitude, VRInputValueHandle_t ulRestrictToDevice) override {
+        return vr::VRInputError_None;
+    }
+    virtual EVRInputError GetActionOrigins(VRActionSetHandle_t actionSetHandle, VRActionHandle_t digitalActionHandle, VRInputValueHandle_t *originsOut, uint32_t originOutCount) override {
+        if (originsOut && originOutCount > 0) {
+            memset(originsOut, 0, sizeof(vr::VRInputValueHandle_t) * originOutCount);
+            if (originOutCount >= 2) {
+                originsOut[0] = 1; // Left Hand
+                originsOut[1] = 2; // Right Hand
+            } else {
+                originsOut[0] = 1;
             }
         }
         return vr::VRInputError_None;
     }
-    virtual EVRInputError GetSkeletalSummaryData(VRActionHandle_t action, EVRSummaryType eSummaryType, VRSkeletalSummaryData_t * pSkeletalSummaryData) override {
-        LogMsg("Called: IVRInput::GetSkeletalSummaryData\n");
-        if (pSkeletalSummaryData) {
-            memset(pSkeletalSummaryData, 0, sizeof(*pSkeletalSummaryData));
-            pSkeletalSummaryData->flFingerCurl[0] = 0.0f;
-            pSkeletalSummaryData->flFingerCurl[1] = 0.0f;
-            pSkeletalSummaryData->flFingerCurl[2] = 0.0f;
-            pSkeletalSummaryData->flFingerCurl[3] = 0.0f;
-            pSkeletalSummaryData->flFingerCurl[4] = 0.0f;
-            pSkeletalSummaryData->flFingerSplay[0] = 0.0f;
-            pSkeletalSummaryData->flFingerSplay[1] = 0.0f;
-            pSkeletalSummaryData->flFingerSplay[2] = 0.0f;
-            pSkeletalSummaryData->flFingerSplay[3] = 0.0f;
+    virtual EVRInputError GetOriginLocalizedName(VRInputValueHandle_t origin, char *pchNameArray, uint32_t unNameArraySize, int32_t unStringSectionsToInclude) override {
+        if(pchNameArray && unNameArraySize > 0) {
+            strncpy(pchNameArray, "Trigger", unNameArraySize - 1);
+            pchNameArray[unNameArraySize - 1] = '\0';
         }
         return vr::VRInputError_None;
     }
-    virtual EVRInputError GetSkeletalBoneDataCompressed(VRActionHandle_t action, EVRSkeletalMotionRange eMotionRange, VR_OUT_BUFFER_COUNT( unCompressedSize ) void *pvCompressedData, uint32_t unCompressedSize, uint32_t *punRequiredCompressedSize) override {
-        LogMsg("Called: IVRInput::GetSkeletalBoneDataCompressed\n");
-        if (punRequiredCompressedSize) *punRequiredCompressedSize = 0;
-        return vr::VRInputError_None;
-    }
-    virtual EVRInputError DecompressSkeletalBoneData(const void *pvCompressedBuffer, uint32_t unCompressedBufferSize, EVRSkeletalTransformSpace eTransformSpace, VR_ARRAY_COUNT( unTransformArrayCount ) VRBoneTransform_t *pTransformArray, uint32_t unTransformArrayCount) override {
-        LogMsg("Called: IVRInput::DecompressSkeletalBoneData\n");
-        return vr::VRInputError_InvalidHandle;
-    }
-    virtual EVRInputError TriggerHapticVibrationAction(VRActionHandle_t action, float fStartSecondsFromNow, float fDurationSeconds, float fFrequency, float fAmplitude, VRInputValueHandle_t ulRestrictToDevice) override {
-        LogMsg("Called: IVRInput::TriggerHapticVibrationAction\n");
-        return vr::VRInputError_InvalidHandle;
-    }
-    virtual EVRInputError GetActionOrigins(VRActionSetHandle_t actionSetHandle, VRActionHandle_t digitalActionHandle, VR_ARRAY_COUNT( originOutCount ) VRInputValueHandle_t *originsOut, uint32_t originOutCount) override {
-        LogMsg("Called: IVRInput::GetActionOrigins\n");
-        if(originsOut && originOutCount > 0) { memset(originsOut, 0, sizeof(vr::VRInputValueHandle_t) * originOutCount); originsOut[0] = actionSetHandle; }
-        return vr::VRInputError_None;
-    }
-    virtual EVRInputError GetOriginLocalizedName(VRInputValueHandle_t origin, VR_OUT_STRING() char *pchNameArray, uint32_t unNameArraySize, int32_t unStringSectionsToInclude) override {
-        LogMsg("Called: IVRInput::GetOriginLocalizedName\n");
-        return vr::VRInputError_InvalidHandle;
-    }
     virtual EVRInputError GetOriginTrackedDeviceInfo(VRInputValueHandle_t origin, InputOriginInfo_t *pOriginInfo, uint32_t unOriginInfoSize) override {
-        LogMsg("Called: IVRInput::GetOriginTrackedDeviceInfo\n");
         if(pOriginInfo && unOriginInfoSize > 0) {
-            vr::InputOriginInfo_t temp = {0};
-            temp.devicePath = origin;
-            temp.trackedDeviceIndex = (origin == 1) ? 1 : 2;
-            memcpy(pOriginInfo, &temp, unOriginInfoSize > sizeof(temp) ? sizeof(temp) : unOriginInfoSize);
+            memset(pOriginInfo, 0, unOriginInfoSize);
+            if (unOriginInfoSize >= sizeof(vr::VRInputValueHandle_t)) {
+                pOriginInfo->devicePath = origin;
+            }
+            if (unOriginInfoSize >= offsetof(InputOriginInfo_t, trackedDeviceIndex) + sizeof(vr::TrackedDeviceIndex_t)) {
+                pOriginInfo->trackedDeviceIndex = origin;
+            }
         }
         return vr::VRInputError_None;
     }
     virtual EVRInputError GetActionBindingInfo(VRActionHandle_t action, InputBindingInfo_t *pOriginInfo, uint32_t unBindingInfoSize, uint32_t unBindingInfoCount, uint32_t *punReturnedBindingInfoCount) override {
-        LogMsg("Called: IVRInput::GetActionBindingInfo\n");
-        if(pOriginInfo && unBindingInfoSize > 0 && unBindingInfoCount > 0) {
+        if (pOriginInfo && unBindingInfoCount > 0 && unBindingInfoSize > 0) {
             memset(pOriginInfo, 0, unBindingInfoSize * unBindingInfoCount);
+            
+            // Write only within the allowed bounds
+            auto safe_strcpy = [unBindingInfoSize](char* dst, const char* src, size_t offset, size_t max_len) {
+                if (offset < unBindingInfoSize) {
+                    size_t available = unBindingInfoSize - offset;
+                    size_t copy_len = (max_len < available) ? max_len : available;
+                    strncpy(dst, src, copy_len - 1);
+                    dst[copy_len - 1] = '\0';
+                }
+            };
+            
+            // Fallback to simple copying if we know the struct matches our definition
+            if (unBindingInfoSize >= sizeof(InputBindingInfo_t)) {
+                strncpy(pOriginInfo[0].rchDevicePathName, "/user/hand/right", 127);
+                strncpy(pOriginInfo[0].rchInputPathName, "/user/hand/right/input/trigger", 127);
+                strncpy(pOriginInfo[0].rchModeName, "trigger", 127);
+                strncpy(pOriginInfo[0].rchSlotName, "click", 127);
+                strncpy(pOriginInfo[0].rchInputSourceType, "trackpad", 31);
+            }
         }
-        if(punReturnedBindingInfoCount) *punReturnedBindingInfoCount = 0;
+        if (punReturnedBindingInfoCount) *punReturnedBindingInfoCount = 1;
         return vr::VRInputError_None;
     }
     virtual EVRInputError ShowActionOrigins(VRActionSetHandle_t actionSetHandle, VRActionHandle_t ulActionHandle) override {
-        LogMsg("Called: IVRInput::ShowActionOrigins\n");
-        return vr::VRInputError_InvalidHandle;
+        return vr::VRInputError_None;
     }
     virtual EVRInputError ShowBindingsForActionSet(VR_ARRAY_COUNT( unSetCount ) VRActiveActionSet_t *pSets, uint32_t unSizeOfVRSelectedActionSet_t, uint32_t unSetCount, VRInputValueHandle_t originToHighlight) override {
-        LogMsg("Called: IVRInput::ShowBindingsForActionSet\n");
-        return vr::VRInputError_InvalidHandle;
+        return vr::VRInputError_None;
     }
     virtual EVRInputError GetComponentStateForBinding(const char *pchRenderModelName, const char *pchComponentName, const InputBindingInfo_t *pOriginInfo, uint32_t unBindingInfoSize, uint32_t unBindingInfoCount, vr::RenderModel_ComponentState_t *pComponentState) override {
-        LogMsg("Called: IVRInput::GetComponentStateForBinding\n");
-        return vr::VRInputError_InvalidHandle;
+        return vr::VRInputError_None;
     }
     virtual bool IsUsingLegacyInput() override {
-        LogMsg("Called: IVRInput::IsUsingLegacyInput\n");
         return false;
     }
     virtual EVRInputError OpenBindingUI(const char* pchAppKey, VRActionSetHandle_t ulActionSetHandle, VRInputValueHandle_t ulDeviceHandle, bool bShowOnDesktop) override {

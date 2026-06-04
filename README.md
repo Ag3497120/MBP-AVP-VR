@@ -2,11 +2,15 @@
 
 A Native VR Hooking and Proxy System designed for Half-Life: Alyx on macOS.
 
-## The Native Vulkan Architecture (Project Beer)
+## The D3DMetal HEVC VR Bridge Architecture (Latest)
 
-Originally, this project attempted to utilize Apple's Game Porting Toolkit (D3DMetal) to translate DirectX 11. However, due to stripped Vulkan initialization within Apple's `wine64` and Rosetta 2 memory alignment access violations within DXVK, DX11 translations proved fatally unstable.
+This project has successfully implemented a hyper-low latency PCVR bridge directly from Mac to Apple Vision Pro using Apple's Game Porting Toolkit (D3DMetal).
 
-**Solution**: Half-Life: Alyx (Source 2) supports a native Vulkan renderer (`-vulkan`). By utilizing **Gcenx Wine-Staging** (which contains full MoltenVK integration), we bypass all DirectX translation layers entirely. The engine natively binds to Vulkan, which MoltenVK seamlessly translates to Apple Metal, providing a hyper-stable VR pipeline on Apple Silicon (M1/M2/M3).
+**Architecture**:
+1. **DirectX 11 Interception**: The `openvr_emulator.cpp` hooks into `hlvr.exe` (Half-Life: Alyx) and intercepts the rendered DirectX 11 stereoscopic textures.
+2. **Hardware Encoding (HEVC)**: `HardwareEncoder.swift` runs natively on macOS, reading the shared memory frames and instantly encoding them using VideoToolbox HEVC (H.265) hardware acceleration.
+3. **UDP Streaming**: The encoded chunks are streamed via UDP directly to the Vision Pro (port 9999).
+4. **Input Mapping**: Joy-Con or standard gamepads connected to the Mac are mapped into VR Controller inputs, feeding directly back into the OpenVR emulator.
 
 ## Setup Instructions
 
