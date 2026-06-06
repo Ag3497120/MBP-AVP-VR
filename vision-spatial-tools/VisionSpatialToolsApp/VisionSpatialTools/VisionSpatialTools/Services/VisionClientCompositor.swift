@@ -1,0 +1,682 @@
+import Foundation
+import Network
+import CoreBluetooth
+import VideoToolbox
+import ARKit
+import RealityKit
+import QuartzCore
+import CompositorServices
+import Metal
+import MetalKit
+/// Phase 14: VisionOS Drop-in SDK (Client Side)
+/// ユーザーが保有する「vision spatial tools」にドロップインで組み込める、
+/// Mac(Verantyx)からのゼロコピー映像のデコードと、JCrossトラッキング情報の送信を行うコアモジュールです。
+public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
+    
+    public var onFrameDecoded: ((CVPixelBuffer) -> Void)?
+    
+    private var listener: NWListener?
+    private var trackingConnection: NWConnection?
+    private var isTrackingConnectionReady = false
+    
+    // --- VideoToolbox (Hardware Decoder) ---
+    private var decoder = HEVCVideoDecoder()
+    
+    // --- Chunk Assembly State ---
+    private var currentSeq: UInt32 = 0
+    private var chunksReceived: UInt32 = 0
+    private var expectedChunks: UInt32 = 0
+    private var maxFrameSize: Int = 0
+    private var frameBuffer = Data()
+    private var dummyBrowser: NWBrowser?
+    private let networkingQueue = DispatchQueue(label: "com.verantyx.networking", qos: .userInteractive)
+    
+    public override init() {
+        super.init()
+        decoder.delegate = self
+        
+        // Force trigger Local Network Permission prompt
+        let descriptor = NWBrowser.Descriptor.bonjour(type: "_verantyxvr._udp", domain: "local")
+        dummyBrowser = NWBrowser(for: descriptor, using: .udp)
+        dummyBrowser?.stateUpdateHandler = { state in
+            print("[VisionClient] Browser state: \(state)")
+        }
+        dummyBrowser?.start(queue: .main)
+        
+        reconnect(to: "")
+    }
+    
+    private var joyconConnection: NWConnection?
+    
+    public func reconnect(to ip: String) {
+        trackingConnection?.cancel()
+        trackingConnection = nil
+        
+        let trackingParams = NWParameters.udp
+        let joyconParams = NWParameters.udp
+        
+        let targetIP = ip
+        let endpoint: NWEndpoint
+        if targetIP.isEmpty {
+            endpoint = NWEndpoint.service(name: "VerantyxVR", type: "_verantyxvr._udp", domain: "local", interface: nil)
+        } else {
+            endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(targetIP), port: NWEndpoint.Port(rawValue: 9999)!)
+        }
+        
+        trackingConnection = NWConnection(to: endpoint, using: trackingParams)
+        
+        let joyconEndpoint: NWEndpoint
+        if targetIP.isEmpty {
+            joyconEndpoint = NWEndpoint.service(name: "VerantyxJoyc", type: "_verantyxjoyc._udp", domain: "local", interface: nil)
+        } else {
+            joyconEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(targetIP), port: NWEndpoint.Port(rawValue: 11002)!)
+        }
+        
+        joyconConnection?.cancel()
+        joyconConnection = NWConnection(to: joyconEndpoint, using: joyconParams)
+        
+        if targetIP.isEmpty {
+            print("[VisionClient] Searching for Mac via AWDL Bonjour (_verantyxvr._udp)...")
+        } else {
+            print("[VisionClient] Connecting directly to Mac at \(targetIP):9999 and 11002...")
+        }
+        
+        self.packetCount = 0
+        var hasStartedReceiving = false
+        
+        trackingConnection?.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            print("[VisionClient] Connection state: \(state)")
+            if state == .ready {
+                self.isTrackingConnectionReady = true
+                if !hasStartedReceiving {
+                    hasStartedReceiving = true
+                    self.receiveMessage()
+                }
+            } else {
+                self.isTrackingConnectionReady = false
+            }
+        }
+        
+        trackingConnection?.start(queue: networkingQueue)
+        joyconConnection?.start(queue: networkingQueue)
+    }
+    
+    private var packetCount = 0
+    private func receiveMessage() {
+        trackingConnection?.receiveMessage { [weak self] (content, context, isComplete, error) in
+            if let data = content {
+                self?.packetCount += 1
+                if let count = self?.packetCount {
+                    if count <= 5 || count % 300 == 0 {
+                        print("[VisionClient] RAW PACKET RECEIVED! size: \(data.count) (packet #\(count))")
+                    }
+                }
+                self?.processUDPPacket(data)
+            }
+            if error == nil && self?.trackingConnection?.state == .ready {
+                self?.receiveMessage()
+            } else {
+                print("[VisionClient] Receive error or disconnected: \(String(describing: error))")
+            }
+        }
+    }
+    
+    private func processUDPPacket(_ data: Data) {
+        guard data.count >= 24 else { return }
+        
+        let magic = data[0..<4].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        guard magic == 0x5652414E else { return } // Match HardwareEncoder's 0x5652414E
+        
+        let seq = data[4..<8].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        let chunkIdx = data[8..<12].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        let totalChunks = data[12..<16].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        let chunkOffset = data[16..<20].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        let payloadSize = data[20..<24].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        
+        // Print the first few packets unconditionally to verify reception
+        if seq < 10 && chunkIdx == 0 {
+            print("[VisionClient] Received UDP packet: seq=\\(seq) chunk=\\(chunkIdx)/\\(totalChunks)")
+        } else if chunkIdx == 0 && seq % 60 == 0 {
+            print("[VisionClient] Received UDP packet: seq=\\(seq) chunk=\\(chunkIdx)/\\(totalChunks)")
+        }
+        
+        if seq < currentSeq {
+            // Ignore late packets from older frames
+            return
+        }
+        
+        if seq > currentSeq {
+            currentSeq = seq
+            chunksReceived = 0
+            expectedChunks = totalChunks
+            maxFrameSize = 0
+            frameBuffer.removeAll(keepingCapacity: true)
+            // Pre-allocate to prevent array out of bounds when assembling out of order
+            frameBuffer = Data(count: Int(totalChunks * 60000)) 
+        }
+        
+        let payloadData = data.subdata(in: 24..<(24 + Int(payloadSize)))
+        
+        // Place data at the exact offset
+        let endOffset = Int(chunkOffset) + Int(payloadSize)
+        if endOffset > maxFrameSize {
+            maxFrameSize = endOffset
+        }
+        
+        if endOffset <= frameBuffer.count {
+            frameBuffer.replaceSubrange(Int(chunkOffset)..<endOffset, with: payloadData)
+        } else {
+            // Expand buffer if needed
+            let padding = Data(count: endOffset - frameBuffer.count)
+            frameBuffer.append(padding)
+            frameBuffer.replaceSubrange(Int(chunkOffset)..<endOffset, with: payloadData)
+        }
+        
+        chunksReceived += 1
+        
+        if chunksReceived == expectedChunks {
+            // Trim buffer to actual frame size
+            let completeFrame = frameBuffer.subdata(in: 0..<maxFrameSize)
+            print("[VisionClient] Complete frame assembled! Size: \(completeFrame.count) bytes. Sending to decoder...")
+            decoder.decodeAnnexBFrame(completeFrame)
+        }
+    }
+    
+    // MARK: - HEVCVideoDecoderDelegate
+    public func didDecodeFrame(_ pixelBuffer: CVPixelBuffer) {
+        onFrameDecoded?(pixelBuffer)
+    }
+    
+    // MARK: - Pose Upload
+    
+    public func sendPose(head: simd_float4x4, leftHand: simd_float4x4, rightHand: simd_float4x4, leftPinch: Bool, rightPinch: Bool) {
+        guard isTrackingConnectionReady, let trackingConnection = trackingConnection else { return }
+        
+        var packetData = Data()
+        
+        // magic (0x504F5345 = "POSE")
+        var magic: UInt32 = 0x45534F50 // "POSE" in little endian
+        packetData.append(Data(bytes: &magic, count: 4))
+        
+        func appendMatrix(_ matrix: simd_float4x4) {
+            var m = matrix
+            // Copy matrix columns as a contiguous float array
+            let data = Data(bytes: &m, count: 64)
+            packetData.append(data)
+        }
+        
+        // Debug print the translation to prove we are sending active tracking data
+        if Int.random(in: 0...60) == 0 {
+            let pos = head.columns.3
+            print("[VisionClient] Sending POSE: x=\\(pos.x) y=\\(pos.y) z=\\(pos.z)")
+        }
+        
+        appendMatrix(head)
+        appendMatrix(leftHand)
+        appendMatrix(rightHand)
+        
+        var lPinch: UInt8 = leftPinch ? 1 : 0
+        var rPinch: UInt8 = rightPinch ? 1 : 0
+        
+        packetData.append(Data(bytes: &lPinch, count: 1))
+        packetData.append(Data(bytes: &rPinch, count: 1))
+        
+        trackingConnection.send(content: packetData, completion: .contentProcessed({ error in
+            if let error = error {
+                print("[VisionClient] Failed to send POSE packet: \(error)")
+            }
+        }))
+    }
+    
+    public func sendJoycon(rightButtons: UInt32, leftButtons: UInt32,
+                           rightStickX: Float, rightStickY: Float,
+                           leftStickX: Float, leftStickY: Float,
+                           rightVelX: Float, rightVelY: Float, rightVelZ: Float,
+                           leftVelX: Float, leftVelY: Float, leftVelZ: Float) {
+        guard let joyconConnection = joyconConnection else { return }
+        
+        var packetData = Data()
+        var magic: UInt32 = 0x4A4F5943 // Match HardwareEncoder's 0x4A4F5943
+        packetData.append(Data(bytes: &magic, count: 4))
+        
+        var rBtn = rightButtons
+        var lBtn = leftButtons
+        packetData.append(Data(bytes: &rBtn, count: 4))
+        packetData.append(Data(bytes: &lBtn, count: 4))
+        
+        var rsX = rightStickX, rsY = rightStickY
+        var lsX = leftStickX, lsY = leftStickY
+        packetData.append(Data(bytes: &rsX, count: 4))
+        packetData.append(Data(bytes: &rsY, count: 4))
+        packetData.append(Data(bytes: &lsX, count: 4))
+        packetData.append(Data(bytes: &lsY, count: 4))
+        
+        var rvX = rightVelX, rvY = rightVelY, rvZ = rightVelZ
+        var lvX = leftVelX, lvY = leftVelY, lvZ = leftVelZ
+        packetData.append(Data(bytes: &rvX, count: 4))
+        packetData.append(Data(bytes: &rvY, count: 4))
+        packetData.append(Data(bytes: &rvZ, count: 4))
+        packetData.append(Data(bytes: &lvX, count: 4))
+        packetData.append(Data(bytes: &lvY, count: 4))
+        packetData.append(Data(bytes: &lvZ, count: 4))
+        
+        joyconConnection.send(content: packetData, completion: .contentProcessed({ error in
+            if let error = error {
+                print("[VisionClient] Failed to send JOYC packet: \(error)")
+            }
+        }))
+    }
+}
+
+class CompositorRenderer {
+    private var renderFrameCount: Int = 0
+    let layerRenderer: LayerRenderer
+    let worldTrackingProvider: WorldTrackingProvider
+    let device: MTLDevice
+    let commandQueue: MTLCommandQueue
+    var pipelineState: MTLRenderPipelineState?
+    var pipelineStateNoVideo: MTLRenderPipelineState?
+    var samplerState: MTLSamplerState?
+    var textureCache: CVMetalTextureCache?
+    
+    // インスタンスに担当しない。AppModel共有バッファを参照する。
+    // CompositorLayerクロージャが何度啇び出されても、
+    // 常に同じ AppModelのバッファを読む。
+    private weak var appModel: AppModel?
+    
+    init(_ layerRenderer: LayerRenderer, appModel: AppModel) {
+        self.layerRenderer = layerRenderer
+        self.worldTrackingProvider = appModel.worldTrackingProvider
+        self.appModel = appModel          // ← 共有バッファへの参照を保持
+        self.device = layerRenderer.device
+        self.commandQueue = self.device.makeCommandQueue()!
+        
+        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, self.device, nil, &textureCache)
+        let samplerDesc = MTLSamplerDescriptor()
+        samplerDesc.minFilter = .linear
+        samplerDesc.magFilter = .linear
+        samplerDesc.sAddressMode = .clampToEdge
+        samplerDesc.tAddressMode = .clampToEdge
+        self.samplerState = self.device.makeSamplerState(descriptor: samplerDesc)
+        
+        setupPipeline()
+    }
+    
+    func setupPipeline() {
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        struct VertexOut {
+            float4 position [[position]];
+            float2 texCoord;
+            uint eyeIndex;
+        };
+
+        vertex VertexOut vrVertexShader(uint vertexID [[vertex_id]],
+                                      uint ampID [[amplification_id]],
+                                      constant float4x4 *projectionMatrices [[buffer(0)]],
+                                      constant float4 *tangentsArray [[buffer(1)]],
+                                      constant float4x4 *headMatrices [[buffer(2)]]) {
+            
+            float4 tangents = tangentsArray[ampID];
+            float left = tangents[0];
+            float right = tangents[1];
+            float top = tangents[2];
+            float bottom = tangents[3];
+            
+            // Quad perfectly sized to the view frustum at Z = -1
+            float2 positions[6] = {
+                float2(left, bottom),
+                float2(right, bottom),
+                float2(left, top),
+                float2(left, top),
+                float2(right, bottom),
+                float2(right, top)
+            };
+            
+            float2 texCoords[6] = {
+                float2(0.0, 1.0),
+                float2(1.0, 1.0),
+                float2(0.0, 0.0),
+                float2(0.0, 0.0),
+                float2(1.0, 1.0),
+                float2(1.0, 0.0)
+            };
+            
+            // Draw the quad in View Space, exactly 1 meter away
+            float4 viewSpacePos = float4(positions[vertexID], -1.0, 1.0);
+            
+            VertexOut out;
+            // Project perfectly into OS clip space using the provided matrix
+            out.position = projectionMatrices[ampID] * viewSpacePos;
+            out.texCoord = texCoords[vertexID];
+            out.eyeIndex = ampID;
+            return out;
+        }
+
+        fragment float4 vrFragmentShader(VertexOut in [[stage_in]],
+                                       texture2d<float, access::sample> videoTexture [[texture(0)]],
+                                       sampler videoSampler [[sampler(0)]]) {
+            float2 uv = in.texCoord;
+            
+            // SteamVR sends Side-by-Side (SBS) video. 
+            // Left eye (eyeIndex == 0) reads the left half of the texture.
+            // Right eye (eyeIndex == 1) reads the right half.
+            if (in.eyeIndex == 0) {
+                uv.x = uv.x * 0.5;
+            } else {
+                uv.x = uv.x * 0.5 + 0.5;
+            }
+            
+            float4 color = videoTexture.sample(videoSampler, uv);
+            
+            // If the texture is YUV (r8Unorm), G and B channels are 0. Make it grayscale.
+            if (color.g == 0.0 && color.b == 0.0 && color.r > 0.0) {
+                color = float4(color.r, color.r, color.r, 1.0);
+            }
+            
+            return color;
+        }
+
+        fragment float4 vrFragmentShaderNoVideo(VertexOut in [[stage_in]]) {
+            // Just return green when there is no video
+            return float4(0.0, 1.0, 0.0, 1.0);
+        }
+        """
+
+        do {
+            let library = try device.makeLibrary(source: shaderSource, options: nil)
+            print("[CompositorRenderer] Successfully compiled MTLLibrary from source")
+            
+            let vertexFunction = library.makeFunction(name: "vrVertexShader")
+            let fragmentFunction = library.makeFunction(name: "vrFragmentShader")
+            let fragmentFunctionNoVideo = library.makeFunction(name: "vrFragmentShaderNoVideo")
+            
+            let pipelineDescriptor = MTLRenderPipelineDescriptor()
+            pipelineDescriptor.vertexFunction = vertexFunction
+            pipelineDescriptor.fragmentFunction = fragmentFunction
+            pipelineDescriptor.colorAttachments[0].pixelFormat = layerRenderer.configuration.colorFormat
+            pipelineDescriptor.depthAttachmentPixelFormat = layerRenderer.configuration.depthFormat
+            
+            // Required by Vision Pro when using render_target_array_index
+            pipelineDescriptor.inputPrimitiveTopology = .triangle
+            
+            // Critical for stereoscopic layered rendering
+            pipelineDescriptor.maxVertexAmplificationCount = layerRenderer.configuration.layout == .layered ? 2 : 1
+            
+            self.pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+            
+            // Create the No Video pipeline
+            let pipelineDescriptorNoVideo = MTLRenderPipelineDescriptor()
+            pipelineDescriptorNoVideo.vertexFunction = vertexFunction
+            pipelineDescriptorNoVideo.fragmentFunction = fragmentFunctionNoVideo
+            pipelineDescriptorNoVideo.colorAttachments[0].pixelFormat = layerRenderer.configuration.colorFormat
+            pipelineDescriptorNoVideo.depthAttachmentPixelFormat = layerRenderer.configuration.depthFormat
+            pipelineDescriptorNoVideo.inputPrimitiveTopology = .triangle
+            pipelineDescriptorNoVideo.maxVertexAmplificationCount = layerRenderer.configuration.layout == .layered ? 2 : 1
+            
+            self.pipelineStateNoVideo = try device.makeRenderPipelineState(descriptor: pipelineDescriptorNoVideo)
+            
+            let samplerDesc = MTLSamplerDescriptor()
+            samplerDesc.minFilter = .linear
+            samplerDesc.magFilter = .linear
+            samplerDesc.sAddressMode = .clampToEdge
+            samplerDesc.tAddressMode = .clampToEdge
+            self.samplerState = device.makeSamplerState(descriptor: samplerDesc)
+            
+            print("[CompositorRenderer] Pipelines created successfully")
+            
+        } catch {
+            print("[CompositorRenderer] Failed to create pipeline state: \(String(describing: error))")
+        }
+    }
+    
+    private var depthState: MTLDepthStencilState?
+
+    func startRenderLoop() {
+        let depthDesc = MTLDepthStencilDescriptor()
+        depthDesc.depthCompareFunction = .always
+        depthDesc.isDepthWriteEnabled = true
+        self.depthState = device.makeDepthStencilState(descriptor: depthDesc)
+        
+        let thread = Thread {
+            do {
+                try self.renderLoop()
+            } catch {
+                print("[CompositorRenderer] Render loop error: \(error)")
+            }
+        }
+        thread.name = "com.verantyx.renderloop"
+        thread.start()
+    }
+    
+    private func renderLoop() throws {
+        
+        while true {
+            guard layerRenderer.state != .invalidated else {
+                print("[CompositorRenderer] Layer invalidated, stopping loop")
+                break
+            }
+            guard layerRenderer.state != .paused else {
+                if renderFrameCount % 60 == 0 { print("[CompositorRenderer] Layer is paused...") }
+                Thread.sleep(forTimeInterval: 0.1)
+                continue
+            }
+            
+            guard let frame = layerRenderer.queryNextFrame() else { continue }
+            frame.startUpdate()
+            frame.endUpdate()
+            
+            guard let timing = frame.predictTiming() else { continue }
+            LayerRenderer.Clock().wait(until: timing.optimalInputTime)
+            
+            // In visionOS, we cannot use plain CACurrentMediaTime for the device anchor.
+            // We must predict the exact target time using the Compositor's Clock Instant.
+            let duration = LayerRenderer.Clock.Instant.epoch.duration(to: timing.presentationTime)
+            let exactSeconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+            
+            // 完璧な未来予測時刻で頭の位置を取得
+            let predictedAnchor = worldTrackingProvider.state == .running
+                ? worldTrackingProvider.queryDeviceAnchor(atTimestamp: exactSeconds)
+                : nil
+                
+            // 未来予測時刻のアンカーが取れなかった場合は、現在時刻のアンカーでフォールバック（画面が真っ黒になるのを防ぐ）
+            let validAnchor = predictedAnchor ?? (worldTrackingProvider.state == .running ? worldTrackingProvider.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()) : nil)
+            
+            if renderFrameCount % 300 == 0 {
+                let hasPB = appModel?.latestPixelBuffer != nil
+                let anchorStatus = validAnchor == nil ? "NIL (World Origin)" : (predictedAnchor != nil ? "VALID (Predicted)" : "VALID (Fallback)")
+                print("[CompositorRenderer] Layer running. renderFrame=\(renderFrameCount) hasPixelBuffer=\(hasPB) anchor=\(anchorStatus)")
+            }
+            
+            guard let drawable = frame.queryDrawable() else { continue }
+            
+            frame.startSubmission()
+            
+            if let anchor = validAnchor {
+                drawable.deviceAnchor = anchor
+            }
+            
+            let currentHeadT = validAnchor?.originFromAnchorTransform ?? matrix_identity_float4x4
+            renderFrame(drawable: drawable, headT: currentHeadT)
+            
+            frame.endSubmission()
+            renderFrameCount += 1
+        }
+    }
+    
+    private func renderFrame(drawable: LayerRenderer.Drawable, headT: simd_float4x4) {
+        let isLayered = layerRenderer.configuration.layout == .layered
+        let viewCount = drawable.views.count
+        
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        
+        // 映像フレームを取得
+        let pb = appModel?.latestPixelBuffer
+        var metalTexture: MTLTexture? = nil
+        
+        if let pb = pb, let tc = self.textureCache {
+            let actualFmt = CVPixelBufferGetPixelFormatType(pb)
+            var cvTextureOut: CVMetalTexture?
+            var metalPixelFormat: MTLPixelFormat = .bgra8Unorm
+            var planeIndex: Int = 0
+            
+            let kBGRA: OSType = kCVPixelFormatType_32BGRA
+            let k420v: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            let k420f: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            
+            if actualFmt == kBGRA {
+                metalPixelFormat = .bgra8Unorm
+            } else if actualFmt == k420v || actualFmt == k420f {
+                metalPixelFormat = .r8Unorm
+                planeIndex = 0
+            }
+            
+            let texWidth = planeIndex == 0 ? CVPixelBufferGetWidth(pb) : CVPixelBufferGetWidthOfPlane(pb, planeIndex)
+            let texHeight = planeIndex == 0 ? CVPixelBufferGetHeight(pb) : CVPixelBufferGetHeightOfPlane(pb, planeIndex)
+            
+            let status = CVMetalTextureCacheCreateTextureFromImage(
+                kCFAllocatorDefault, tc, pb, nil,
+                metalPixelFormat,
+                texWidth, texHeight, planeIndex,
+                &cvTextureOut
+            )
+            
+            if status == kCVReturnSuccess, let cvt = cvTextureOut {
+                metalTexture = CVMetalTextureGetTexture(cvt)
+            }
+        }
+        
+        let rpdesc = MTLRenderPassDescriptor()
+        rpdesc.colorAttachments[0].texture    = drawable.colorTextures[0]
+        rpdesc.colorAttachments[0].loadAction  = .clear
+        rpdesc.colorAttachments[0].storeAction = .store
+        // 🔥 If video is missing or invalid, clear to BLUE. If video is present, clear to BLACK.
+        rpdesc.colorAttachments[0].clearColor  = metalTexture == nil 
+            ? MTLClearColor(red: 0.0, green: 0.0, blue: 0.5, alpha: 1.0) 
+            : MTLClearColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0)
+        
+        if drawable.depthTextures.count > 0 {
+            rpdesc.depthAttachment.texture = drawable.depthTextures[0]
+            rpdesc.depthAttachment.loadAction = .clear
+            rpdesc.depthAttachment.storeAction = .store
+            rpdesc.depthAttachment.clearDepth = 0.0
+        }
+        
+        if isLayered { rpdesc.renderTargetArrayLength = viewCount }
+        
+        if let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpdesc) {
+            enc.setRenderPipelineState(pipelineState!)
+            enc.setCullMode(.none)
+            if let ds = self.depthState {
+                enc.setDepthStencilState(ds)
+            }
+            
+            if isLayered {
+                var mappings = (0..<viewCount).map { i in
+                    MTLVertexAmplificationViewMapping(
+                        viewportArrayIndexOffset: UInt32(i),
+                        renderTargetArrayIndexOffset: UInt32(i)
+                    )
+                }
+                enc.setVertexAmplificationCount(viewCount, viewMappings: &mappings)
+            }
+            enc.setViewports(drawable.views.map { $0.textureMap.viewport })
+            
+            // 🔥 OSから提供された完璧なプロジェクション行列（視界情報）をMetalに渡す
+            // VisionOSでは tangents (left, right, top, bottom) からプロジェクション行列を自力で構築する
+            func makeProj(_ tangents: simd_float4) -> simd_float4x4 {
+                let left = tangents[0]
+                let right = tangents[1]
+                let top = tangents[2]
+                let bottom = tangents[3]
+                let nearZ: Float = 0.01
+                let farZ: Float = 100.0
+                
+                let x = 2.0 / (right - left)
+                let y = 2.0 / (top - bottom)
+                let a = (right + left) / (right - left)
+                let b = (top + bottom) / (top - bottom)
+                // Reverse-Z mapping for visionOS
+                let c = nearZ / (farZ - nearZ)
+                let d = (farZ * nearZ) / (farZ - nearZ)
+                
+                return simd_float4x4(
+                    simd_float4(x, 0, 0, 0),
+                    simd_float4(0, y, 0, 0),
+                    simd_float4(a, b, c, -1),
+                    simd_float4(0, 0, d, 0)
+                )
+            }
+            
+            var proj0 = makeProj(drawable.views[0].tangents)
+            var proj1 = isLayered && viewCount > 1 ? makeProj(drawable.views[1].tangents) : proj0
+            var uniforms: [simd_float4x4] = [proj0, proj1]
+            enc.setVertexBytes(&uniforms, length: MemoryLayout<simd_float4x4>.stride * 2, index: 0)
+            
+            var tan0 = drawable.views[0].tangents
+            var tan1 = isLayered && viewCount > 1 ? drawable.views[1].tangents : tan0
+            var tangentsArray: [simd_float4] = [tan0, tan1]
+            enc.setVertexBytes(&tangentsArray, length: MemoryLayout<simd_float4>.stride * 2, index: 1)
+            
+            var headArray: [simd_float4x4] = [headT, headT]
+            enc.setVertexBytes(&headArray, length: MemoryLayout<simd_float4x4>.stride * 2, index: 2)
+            
+            if let tex = metalTexture, let sampler = self.samplerState {
+                enc.setFragmentTexture(tex, index: 0)
+                enc.setFragmentSamplerState(sampler, index: 0)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            }
+            
+            enc.endEncoding()
+        }
+        
+        drawable.encodePresent(commandBuffer: commandBuffer)
+        commandBuffer.commit()
+        if let tc = self.textureCache {
+            CVMetalTextureCacheFlush(tc, 0)
+        }
+    }
+    
+    private func renderFallback(drawable: LayerRenderer.Drawable, isLayered: Bool, viewCount: Int, color: MTLClearColor) {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        
+        let rpdesc = MTLRenderPassDescriptor()
+        rpdesc.colorAttachments[0].texture    = drawable.colorTextures[0]
+        rpdesc.colorAttachments[0].loadAction  = .clear
+        rpdesc.colorAttachments[0].storeAction = .store
+        rpdesc.colorAttachments[0].clearColor  = color
+        
+        if drawable.depthTextures.count > 0 {
+            rpdesc.depthAttachment.texture = drawable.depthTextures[0]
+            rpdesc.depthAttachment.loadAction = .clear
+            rpdesc.depthAttachment.storeAction = .store
+            rpdesc.depthAttachment.clearDepth = 0.0
+        }
+        
+        if isLayered { rpdesc.renderTargetArrayLength = viewCount }
+        
+        if let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpdesc) {
+            if let pipeline = pipelineStateNoVideo {
+                enc.setRenderPipelineState(pipeline)
+                if isLayered {
+                    var mappings = (0..<viewCount).map { i in
+                        MTLVertexAmplificationViewMapping(
+                            viewportArrayIndexOffset: UInt32(i),
+                            renderTargetArrayIndexOffset: UInt32(i)
+                        )
+                    }
+                    enc.setVertexAmplificationCount(viewCount, viewMappings: &mappings)
+                }
+                enc.setViewports(drawable.views.map { $0.textureMap.viewport })
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            }
+            enc.endEncoding()
+        }
+        
+        drawable.encodePresent(commandBuffer: commandBuffer)
+        commandBuffer.commit()
+    }
+}
