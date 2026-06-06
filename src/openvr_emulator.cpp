@@ -281,7 +281,18 @@ public:
                 } else {
                     pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1; 
                     pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1; 
-                    pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1; 
+                    pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1;
+                    if (i == 0) { // HMD
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.5f; // Y (Height)
+                    } else if (i == 1) { // Left Controller
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] = -0.2f; // X
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.2f;  // Y
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[2][3] = -0.4f; // Z
+                    } else if (i == 2) { // Right Controller
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] = 0.2f;  // X
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.2f;  // Y
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[2][3] = -0.4f; // Z
+                    }
                 }
             } 
         }
@@ -373,45 +384,25 @@ public:
         return (uint32_t)0;
     }
     virtual uint32_t GetStringTrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, VR_OUT_STRING() char *pchValue, uint32_t unBufferSize, ETrackedPropertyError *pError = 0L) override {
-        const char* s = "";
-        bool handled = true;
+        const char* s = "Generic";
         if (prop == vr::Prop_RenderModelName_String) {
             if (unDeviceIndex == 0) s = "generic_hmd";
             else if (unDeviceIndex == 1) s = "{indexcontroller}valve_controller_knu_1_0_left";
             else if (unDeviceIndex == 2) s = "{indexcontroller}valve_controller_knu_1_0_right";
         }
-        else if (prop == vr::Prop_ControllerType_String) s = "knuckles";
-        else if (prop == vr::Prop_TrackingSystemName_String) s = "lighthouse";
-        else if (prop == vr::Prop_ManufacturerName_String) s = "Valve";
-        else if (prop == vr::Prop_ResourceRoot_String) s = "indexcontroller";
-        else if (prop == vr::Prop_RegisteredDeviceType_String) {
+        if (prop == vr::Prop_ControllerType_String) s = "knuckles";
+        if (prop == vr::Prop_TrackingSystemName_String) s = "lighthouse";
+        if (prop == vr::Prop_ManufacturerName_String) s = "Valve";
+        if (prop == vr::Prop_ResourceRoot_String) s = "indexcontroller";
+        if (prop == vr::Prop_InputProfilePath_String) s = "{indexcontroller}/input/index_controller_profile.json";
+        if (prop == vr::Prop_ModelNumber_String) {
+            if (unDeviceIndex == 1) s = "Knuckles Left";
+            else if (unDeviceIndex == 2) s = "Knuckles Right";
+        }
+        if (prop == vr::Prop_RegisteredDeviceType_String) {
             if (unDeviceIndex == 1) s = "valve/index_controllerLHR-FFFFFFFF";
             else if (unDeviceIndex == 2) s = "valve/index_controllerLHR-EEEEEEEE";
         }
-        else if (prop == vr::Prop_SerialNumber_String) {
-            if (unDeviceIndex == 1) s = "LHR-FFFFFFFF";
-            else if (unDeviceIndex == 2) s = "LHR-EEEEEEEE";
-            else s = "LHR-DDDDDDDD";
-        }
-        else if (prop == vr::Prop_ModelNumber_String) {
-            if (unDeviceIndex == 1) s = "Knuckles Left";
-            else if (unDeviceIndex == 2) s = "Knuckles Right";
-            else s = "HMD";
-        }
-        else if (prop == vr::Prop_InputProfilePath_String) {
-            s = "{indexcontroller}/input/index_controller_profile.json";
-        }
-        else if (prop == vr::Prop_AttachedDeviceId_String) {
-            if (unDeviceIndex == 1) s = "123456789";
-            else if (unDeviceIndex == 2) s = "987654321";
-        } else {
-            handled = false;
-            char msg[256];
-            snprintf(msg, sizeof(msg), "Unhandled String Prop: %d for device %d\n", prop, unDeviceIndex);
-            LogMsg(msg);
-            s = "Generic";
-        }
-
         if(pchValue && unBufferSize > 0) { strncpy(pchValue, s, unBufferSize - 1); pchValue[unBufferSize - 1] = '\0'; }
         if(pError) *pError = vr::TrackedProp_Success;
         return (uint32_t)strlen(s) + 1;
@@ -502,17 +493,19 @@ public:
                 uint32_t lb = pSharedHands->leftButtons;
                 uint32_t rb = pSharedHands->rightButtons;
                 if (unControllerDeviceIndex == 1) {
-                    if (pSharedHands->leftPinch) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
+                    if ((lb & (1<<7)) != 0 || (lb & (1<<8)) != 0) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip); // L
                     if (lb & (1<<4)) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } // ZL
                     if (lb & (1<<5)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // L3
                     if (lb & (1<<6)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_System); // Minus
+                    if (lb & (1<<0)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_A); // Left D-Pad Right -> A
+                    if (lb & (1<<1)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu); // Left D-Pad Down -> B
                     pControllerState->rAxis[0].x = pSharedHands->leftStickX;
                     pControllerState->rAxis[0].y = -pSharedHands->leftStickY;
                 } else if (unControllerDeviceIndex == 2) {
-                    if (pSharedHands->rightPinch) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
-                    if (rb & (1<<2)) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } // ZR
-                    if (rb & (1<<0)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_A); // A
-                    if (rb & (1<<1)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu); // B -> App Menu
+                    if ((rb & (1<<5)) != 0 || (rb & (1<<6)) != 0) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip); // R
+                    if ((rb & (1<<2)) != 0 || (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } // ZR or Space
+                    if ((rb & (1<<0)) != 0 || (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_A); // A or Space
+                    if (rb & (1<<1)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu); // B
                     if (rb & (1<<3)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // R3
                     if (rb & (1<<4)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_System); // Plus
                     pControllerState->rAxis[0].x = pSharedHands->rightStickX;
@@ -535,6 +528,15 @@ public:
                 for(int r=0;r<3;r++) for(int c=0;c<4;c++) pTrackedDevicePose->mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->rightTransform[c*4 + r];
             } else {
                 pTrackedDevicePose->mDeviceToAbsoluteTracking.m[0][0] = 1; pTrackedDevicePose->mDeviceToAbsoluteTracking.m[1][1] = 1; pTrackedDevicePose->mDeviceToAbsoluteTracking.m[2][2] = 1;
+                if (unControllerDeviceIndex == 1) { // Left
+                    pTrackedDevicePose->mDeviceToAbsoluteTracking.m[0][3] = -0.2f;
+                    pTrackedDevicePose->mDeviceToAbsoluteTracking.m[1][3] = 1.2f;
+                    pTrackedDevicePose->mDeviceToAbsoluteTracking.m[2][3] = -0.4f;
+                } else if (unControllerDeviceIndex == 2) { // Right
+                    pTrackedDevicePose->mDeviceToAbsoluteTracking.m[0][3] = 0.2f;
+                    pTrackedDevicePose->mDeviceToAbsoluteTracking.m[1][3] = 1.2f;
+                    pTrackedDevicePose->mDeviceToAbsoluteTracking.m[2][3] = -0.4f;
+                }
             }
         }
         return true;
@@ -3243,34 +3245,19 @@ public:
     }
     virtual uint32_t GetResourceFullPath(const char *pchResourceName, const char *pchResourceTypeDirectory, VR_OUT_STRING() char *pchPathBuffer, uint32_t unBufferLen) override {
         char msg[512];
-        snprintf(msg, sizeof(msg), "Called: IVRResources::GetResourceFullPath: %s\n", pchResourceName ? pchResourceName : "null");
-        LogMsg(msg);
-        
-        if (!pchResourceName) return 0;
-        
-        std::string resName(pchResourceName);
-        std::string fullPath = "";
-        
-        std::string baseIndex = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SteamVR\\drivers\\indexcontroller\\resources";
-        std::string baseSteamVR = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SteamVR\\resources";
-        
-        if (resName.find("{indexcontroller}") == 0) {
-            fullPath = baseIndex + resName.substr(17);
-        } else if (resName.find("{steamvr}") == 0) {
-            fullPath = baseSteamVR + resName.substr(9);
-        } else {
-            fullPath = resName;
+        if (pchResourceName) {
+            snprintf(msg, sizeof(msg), "GetResourceFullPath requested: %s\n", pchResourceName);
+            LogMsg(msg);
         }
-        
-        for (int i = 0; i < fullPath.length(); ++i) {
-            if (fullPath[i] == '/') fullPath[i] = '\\';
+        if (pchResourceName && strstr(pchResourceName, "index_controller_profile.json")) {
+            const char* path = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SteamVR\\drivers\\indexcontroller\\resources\\input\\index_controller_profile.json";
+            if (pchPathBuffer && unBufferLen > 0) {
+                strncpy(pchPathBuffer, path, unBufferLen - 1);
+                pchPathBuffer[unBufferLen - 1] = '\0';
+                return strlen(path) + 1;
+            }
         }
-        
-        if (pchPathBuffer && unBufferLen > fullPath.length()) {
-            strcpy(pchPathBuffer, fullPath.c_str());
-            return fullPath.length() + 1;
-        }
-        return fullPath.length() + 1;
+        return (uint32_t)0;
     }
     virtual void* DummyPadding0() { return nullptr; }
     virtual void* DummyPadding1() { return nullptr; }
@@ -3556,35 +3543,33 @@ public:
                 lastLeftBtns = lb;
                 lastRightBtns = rb;
                 
-                if (name.find("Interact") != std::string::npos || name.find("Use") != std::string::npos) {
-                    if (origin == 1) pressed = pSharedHands->leftPinch || leftGripToggle || ((lb & (1<<4)) != 0) || ((lb & (1<<0)) != 0);
-                    else pressed = pSharedHands->rightPinch || rightGripToggle || ((rb & (1<<2)) != 0) || ((rb & (1<<0)) != 0);
-                }
-                else if (name.find("GrabGrip") != std::string::npos || 
+                if (name.find("GrabGrip") != std::string::npos || 
                     name.find("GrabPinch") != std::string::npos ||
                     name.find("Pinch") != std::string::npos ||
                     name.find("Grip") != std::string::npos ||
                     name.find("Grab") != std::string::npos) {
-                    if (origin == 1) pressed = pSharedHands->leftPinch || leftGripToggle;
-                    else pressed = pSharedHands->rightPinch || rightGripToggle;
+                    if (origin == 1) pressed = ((lb & (1<<7)) != 0) || ((lb & (1<<8)) != 0) || pSharedHands->leftPinch; // L or ZL/SL or Pinch
+                    else pressed = ((rb & (1<<5)) != 0) || ((rb & (1<<6)) != 0) || pSharedHands->rightPinch; // R or ZR/SR or Pinch
                 }
-                else if (name.find("Trigger") != std::string::npos || name.find("Fire") != std::string::npos) {
-                    if (origin == 1) pressed = (lb & (1<<4)) != 0;
-                    else pressed = (rb & (1<<2)) != 0;
+                else if (name.find("Trigger") != std::string::npos || name.find("Fire") != std::string::npos || name.find("Interact") != std::string::npos || name.find("Use") != std::string::npos) {
+                    if (origin == 1) pressed = ((lb & (1<<4)) != 0) || pSharedHands->leftPinch; // ZL or Pinch
+                    else pressed = ((rb & (1<<2)) != 0) || ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0) || pSharedHands->rightPinch; // ZR or Spacebar or Pinch
                 }
                 else if (name.find("Teleport") != std::string::npos) {
-                    if (origin == 2) pressed = (rb & (1<<3)) != 0;
-                    else pressed = (lb & (1<<5)) != 0;
+                    if (origin == 2) pressed = (rb & (1<<3)) != 0; // R3
+                    else pressed = (lb & (1<<5)) != 0; // L3
                 }
                 else if (name.find("a_button") != std::string::npos || name.find("AButton") != std::string::npos) {
-                    if (origin == 2) pressed = (rb & (1<<0)) != 0;
+                    if (origin == 2) pressed = ((rb & (1<<0)) != 0) || ((GetAsyncKeyState(VK_SPACE) & 0x8000) != 0); // Right A or Spacebar
+                    else pressed = (lb & (1<<0)) != 0; // Left D-Pad Right
                 }
                 else if (name.find("b_button") != std::string::npos || name.find("BButton") != std::string::npos) {
-                    if (origin == 2) pressed = (rb & (1<<1)) != 0;
+                    if (origin == 2) pressed = (rb & (1<<1)) != 0; // Right B
+                    else pressed = (lb & (1<<1)) != 0; // Left D-Pad Down
                 }
                 else if (name.find("Pause") != std::string::npos || name.find("System") != std::string::npos || name.find("Menu") != std::string::npos) {
-                    if (origin == 2) pressed = (rb & (1<<4)) != 0;
-                    else pressed = (lb & (1<<6)) != 0;
+                    if (origin == 2) pressed = (rb & (1<<4)) != 0; // Plus
+                    else pressed = (lb & (1<<6)) != 0; // Minus
                 }
                 
                 static std::map<std::pair<VRActionHandle_t, uint64_t>, bool> s_lastState;
@@ -3629,8 +3614,8 @@ public:
                     }
                 }
                 else if (name.find("Trigger") != std::string::npos || name.find("Pull") != std::string::npos || name.find("Pinch") != std::string::npos || name.find("Use") != std::string::npos) {
-                    if (origin == 1) x = (lb & (1<<4)) ? 1.0f : 0.0f;
-                    else x = (rb & (1<<2)) ? 1.0f : 0.0f;
+                    if (origin == 1) x = ((lb & (1<<4)) || pSharedHands->leftPinch) ? 1.0f : 0.0f;
+                    else x = ((rb & (1<<2)) || pSharedHands->rightPinch) ? 1.0f : 0.0f;
                 }
                 
                 static std::map<std::pair<VRActionHandle_t, uint64_t>, std::pair<float, float>> s_lastAnalog;

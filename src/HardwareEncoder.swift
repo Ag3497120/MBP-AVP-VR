@@ -249,7 +249,8 @@ var currentWidth = 0
 var currentHeight = 0
 
 // MARK: - Joy-Con UDP Server
-let joyconListener = try? NWListener(using: .udp, on: 11002)
+let joyconListener = try? NWListener(using: parameters, on: 11002)
+joyconListener?.service = NWListener.Service(name: "VerantyxJoyc", type: "_verantyxjoyc._udp")
 joyconListener?.newConnectionHandler = { connection in
     connection.start(queue: .global())
     func receiveNext() {
