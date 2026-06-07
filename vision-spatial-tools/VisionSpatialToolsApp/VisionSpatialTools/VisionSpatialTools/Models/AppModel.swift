@@ -315,39 +315,23 @@ class AppModel: ObservableObject {
                     return simd_distance(simd_make_float3(a.x, a.y, a.z), simd_make_float3(b.x, b.y, b.z))
                 }
                 
-                // 1. Trigger: Thumb to Index
+                // 1. Trigger / Pinch: Thumb to Index (Valve Index Trigger)
                 if dist(thumbPos, indexPos) < 0.025 {
                     buttons |= isRight ? (1 << 2) : (1 << 4) // ZR / ZL
                 }
                 
-                // 2. Grip: Middle, Ring, Pinky curled (close to wrist)
+                // 2. Grip / Grab: Middle, Ring, Pinky curled (Valve Index Grip)
                 if dist(middlePos, wristPos) < 0.08 && dist(ringPos, wristPos) < 0.08 {
                     buttons |= isRight ? (1 << 5) : (1 << 7) // R / L
                 }
                 
-                // 3. A Button / D-Pad Right: Thumb to Ring
-                if dist(thumbPos, ringPos) < 0.025 {
-                    buttons |= (1 << 0)
-                }
+                // HYBRID MODE: Physical Joy-Cons handle locomotion and face buttons (A/B/X/Y).
+                // Hand tracking is ONLY used for spatial position, Trigger, and Grip (to emulate Valve Index Knuckles).
                 
-                // 4. B Button / D-Pad Down: Thumb to Pinky
-                if dist(thumbPos, pinkyPos) < 0.025 {
-                    buttons |= (1 << 1)
-                }
-                
-                // 5. Joystick Mode: Thumb to Middle
-                var stickX: Float = 0.0
-                var stickY: Float = 0.0
-                if dist(thumbPos, middlePos) < 0.03 {
-                    let matrix = hand.originFromAnchorTransform
-                    let upVector = matrix.columns.1
-                    
-                    stickY = Float(-upVector.z * 2.0)
-                    stickX = Float(upVector.x * 2.0)
-                    
-                    stickX = max(-1.0, min(1.0, stickX))
-                    stickY = max(-1.0, min(1.0, stickY))
-                }
+                // Joysticks and face buttons (A/B/X/Y) are EXCLUSIVELY handled by physical Joy-Cons
+                // to prevent accidental misfires from hand tracking.
+                let stickX: Float = 0.0
+                let stickY: Float = 0.0
                 
                 return (buttons, stickX, stickY)
             }
@@ -357,24 +341,17 @@ class AppModel: ObservableObject {
             
             let leftGrip = (leftInputs.buttons & (1 << 7)) != 0
             let rightGrip = (rightInputs.buttons & (1 << 5)) != 0
+            let leftTrigger = (leftInputs.buttons & (1 << 4)) != 0
+            let rightTrigger = (rightInputs.buttons & (1 << 2)) != 0
             
             compositor.sendPose(
                 head: headT,
                 leftHand: leftT,
                 rightHand: rightT,
                 leftPinch: leftGrip,
-                rightPinch: rightGrip
-            )
-            
-            compositor.sendJoycon(
-                rightButtons: rightInputs.buttons,
-                leftButtons: leftInputs.buttons,
-                rightStickX: rightInputs.stickX,
-                rightStickY: rightInputs.stickY,
-                leftStickX: leftInputs.stickX,
-                leftStickY: leftInputs.stickY,
-                rightVelX: 0, rightVelY: 0, rightVelZ: 0,
-                leftVelX: 0, leftVelY: 0, leftVelZ: 0
+                rightPinch: rightGrip,
+                leftTrigger: leftTrigger,
+                rightTrigger: rightTrigger
             )
             
             DispatchQueue.main.async { [weak self] in

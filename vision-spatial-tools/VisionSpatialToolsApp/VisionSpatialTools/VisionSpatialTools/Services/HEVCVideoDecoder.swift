@@ -62,6 +62,10 @@ class HEVCVideoDecoder {
             print("[HEVCDecoder] Found H264 NALs. SPS: \(sps != nil), PPS: \(pps != nil)")
         }
         
+        if formatDescription == nil {
+            print("[HEVCDecoder] Attempting to create format desc for frame \(sequence). size: \(frameData.count). isH264: \(isH264), vps: \(vps != nil), sps: \(sps != nil), pps: \(pps != nil)")
+        }
+        
         // Try to create format description
         if formatDescription == nil {
             if let session = decompressionSession {

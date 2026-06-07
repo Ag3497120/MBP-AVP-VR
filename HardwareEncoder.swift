@@ -80,6 +80,10 @@ print("Published Bonjour _verantyxvr._udp on port 9999. Waiting for Vision Pro c
 
 // MARK: - VideoToolbox Callback
 
+var cachedVPS: Data?
+var cachedSPS: Data?
+var cachedPPS: Data?
+
 func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSequence: UInt32) {
     guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
     var length = 0
@@ -90,38 +94,43 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
     
     var frameData = Data()
     
-    // 1. Extract SPS and PPS for Keyframes
-    if isKeyFrame {
-        if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) {
-            var vpsSize: Int = 0
-            var vpsCount: Int = 0
-            var vpsPtr: UnsafePointer<UInt8>? = nil
-            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDesc, parameterSetIndex: 0, parameterSetPointerOut: &vpsPtr, parameterSetSizeOut: &vpsSize, parameterSetCountOut: &vpsCount, nalUnitHeaderLengthOut: nil)
-            
-            var spsSize: Int = 0
-            var spsCount: Int = 0
-            var spsPtr: UnsafePointer<UInt8>? = nil
-            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDesc, parameterSetIndex: 1, parameterSetPointerOut: &spsPtr, parameterSetSizeOut: &spsSize, parameterSetCountOut: &spsCount, nalUnitHeaderLengthOut: nil)
-            
-            var ppsSize: Int = 0
-            var ppsCount: Int = 0
-            var ppsPtr: UnsafePointer<UInt8>? = nil
-            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDesc, parameterSetIndex: 2, parameterSetPointerOut: &ppsPtr, parameterSetSizeOut: &ppsSize, parameterSetCountOut: &ppsCount, nalUnitHeaderLengthOut: nil)
-            
-            let startCode: [UInt8] = [0, 0, 0, 1]
-            if let vps = vpsPtr {
-                frameData.append(contentsOf: startCode)
-                frameData.append(vps, count: vpsSize)
-            }
-            if let sps = spsPtr {
-                frameData.append(contentsOf: startCode)
-                frameData.append(sps, count: spsSize)
-            }
-            if let pps = ppsPtr {
-                frameData.append(contentsOf: startCode)
-                frameData.append(pps, count: ppsSize)
-            }
+    // 1. Extract and Cache SPS and PPS
+    if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) {
+        var vpsSize: Int = 0
+        var vpsCount: Int = 0
+        var vpsPtr: UnsafePointer<UInt8>? = nil
+        if CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDesc, parameterSetIndex: 0, parameterSetPointerOut: &vpsPtr, parameterSetSizeOut: &vpsSize, parameterSetCountOut: &vpsCount, nalUnitHeaderLengthOut: nil) == noErr, let vps = vpsPtr {
+            cachedVPS = Data(bytes: vps, count: vpsSize)
         }
+        
+        var spsSize: Int = 0
+        var spsCount: Int = 0
+        var spsPtr: UnsafePointer<UInt8>? = nil
+        if CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDesc, parameterSetIndex: 1, parameterSetPointerOut: &spsPtr, parameterSetSizeOut: &spsSize, parameterSetCountOut: &spsCount, nalUnitHeaderLengthOut: nil) == noErr, let sps = spsPtr {
+            cachedSPS = Data(bytes: sps, count: spsSize)
+        }
+        
+        var ppsSize: Int = 0
+        var ppsCount: Int = 0
+        var ppsPtr: UnsafePointer<UInt8>? = nil
+        if CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(formatDesc, parameterSetIndex: 2, parameterSetPointerOut: &ppsPtr, parameterSetSizeOut: &ppsSize, parameterSetCountOut: &ppsCount, nalUnitHeaderLengthOut: nil) == noErr, let pps = ppsPtr {
+            cachedPPS = Data(bytes: pps, count: ppsSize)
+        }
+    }
+    
+    // Prepend to EVERY frame so the Vision Pro can always decode instantly even if a keyframe is dropped
+    let startCode: [UInt8] = [0, 0, 0, 1]
+    if let vps = cachedVPS {
+        frameData.append(contentsOf: startCode)
+        frameData.append(vps)
+    }
+    if let sps = cachedSPS {
+        frameData.append(contentsOf: startCode)
+        frameData.append(sps)
+    }
+    if let pps = cachedPPS {
+        frameData.append(contentsOf: startCode)
+        frameData.append(pps)
     }
     
     // 2. AVCC to Annex-B Conversion
@@ -169,15 +178,14 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
             }
             packet.append(baseAddress + chunkOffset, count: fragSize)
             
-            if let conn = vrConnection, conn.state == .ready {
-                conn.send(content: packet, completion: .contentProcessed { error in
-                    if let error = error {
-                        print("Send error: \(error)")
-                    }
-                })
+            packet.withUnsafeBytes { rawBytes in
+                let _ = sendto(sock, rawBytes.baseAddress, packet.count, 0, withUnsafePointer(to: &targetAddr) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 }
+                }, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
-            print("Sent UDP packet for frame \(frameSequence) frag \(i)/\(numFragments) payload: \(fragSize)")
-            fflush(stdout)
+            
+            // Pace the UDP packets to prevent Vision Pro AWDL / WiFi radio buffer overflows
+            usleep(50)
         }
     }
 }
@@ -188,7 +196,24 @@ var targetIP = "192.168.1.255"
 
 var sock = socket(AF_INET, SOCK_DGRAM, 0)
 var opt: Int32 = 1
-setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &opt, socklen_t(MemoryLayout<Int32>.size))
+setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, socklen_t(MemoryLayout<Int32>.size))
+
+var bindAddr = sockaddr_in()
+bindAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+bindAddr.sin_family = sa_family_t(AF_INET)
+bindAddr.sin_port = in_port_t(9999).bigEndian
+bindAddr.sin_addr.s_addr = INADDR_ANY
+
+let bindResult = withUnsafePointer(to: &bindAddr) {
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+    }
+}
+
+if bindResult < 0 {
+    print("Failed to bind sock to 9999")
+    exit(1)
+}
 
 var targetAddr = sockaddr_in()
 targetAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -209,16 +234,20 @@ func setupEncoder(width: Int32, height: Int32) {
                                             imageBufferAttributes: nil,
                                             compressedDataAllocator: nil,
                                             outputCallback: { (outputCallbackRefCon, sourceFrameRefCon, status, infoFlags, sampleBuffer) in
-        print("VideoToolbox Callback FIRED! Status: \(status)")
-        fflush(stdout)
+        var frameSequence: UInt32 = 0
+        if let sourceFrameRefCon = sourceFrameRefCon {
+            let refConPtr = sourceFrameRefCon.assumingMemoryBound(to: UInt32.self)
+            frameSequence = refConPtr.pointee
+            refConPtr.deinitialize(count: 1)
+            refConPtr.deallocate()
+        }
+        
         if status != noErr {
             print("Encoding error: \(status)")
             return
         }
         guard let sampleBuffer = sampleBuffer else { return }
         let isKeyFrame = !infoFlags.contains(.frameDropped) && (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]] == nil || (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]])?.first?[kCMSampleAttachmentKey_NotSync] == nil)
-        
-        let frameSequence = sourceFrameRefCon!.assumingMemoryBound(to: UInt32.self).pointee
         
         processSampleBuffer(sampleBuffer: sampleBuffer, isKeyFrame: isKeyFrame, frameSequence: frameSequence)
         
@@ -233,6 +262,10 @@ func setupEncoder(width: Int32, height: Int32) {
     
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main_AutoLevel)
+    
+    var bitrate: Int32 = 10_000_000 // 10 Mbps
+    let bitrateNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &bitrate)
+    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateNum)
     
     // Force a keyframe every 30 frames (0.5 seconds at 60fps) to quickly recover from UDP packet loss
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 30 as CFNumber)
@@ -305,24 +338,36 @@ DispatchQueue.global(qos: .userInteractive).async {
         var senderLen = socklen_t(MemoryLayout<sockaddr>.size)
         let bytesRead = recvfrom(jcSock, &buffer, buffer.count, 0, &senderAddr, &senderLen)
         
-        if bytesRead == MemoryLayout<JoyconPacket>.size {
+        var ipStr = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        let senderAddrIn = withUnsafePointer(to: &senderAddr) {
+            $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+        }
+        var sin_addr = senderAddrIn.sin_addr
+        inet_ntop(AF_INET, &sin_addr, &ipStr, socklen_t(INET_ADDRSTRLEN))
+        let senderIP = String(cString: ipStr)
+        
+        if senderIP == "127.0.0.1" && bytesRead == MemoryLayout<JoyconPacket>.size {
             buffer.withUnsafeBytes { rawBuffer in
                 let jc = rawBuffer.load(as: JoyconPacket.self)
                 if jc.magic == UInt32(0x4A4F5943) { // "JOYC"
-                    let trackingOffset = 16 + 4096 * 4096 * 4 // 67108880
-                    
-                    handsMapPtr.advanced(by: trackingOffset + 212).storeBytes(of: jc.rightButtons, as: UInt32.self)
-                    handsMapPtr.advanced(by: trackingOffset + 216).storeBytes(of: jc.leftButtons, as: UInt32.self)
-                    handsMapPtr.advanced(by: trackingOffset + 220).storeBytes(of: jc.rightStickX, as: Float.self)
-                    handsMapPtr.advanced(by: trackingOffset + 224).storeBytes(of: jc.rightStickY, as: Float.self)
-                    handsMapPtr.advanced(by: trackingOffset + 228).storeBytes(of: jc.leftStickX, as: Float.self)
-                    handsMapPtr.advanced(by: trackingOffset + 232).storeBytes(of: jc.leftStickY, as: Float.self)
-                    handsMapPtr.advanced(by: trackingOffset + 236).storeBytes(of: jc.rightVelocityX, as: Float.self)
-                    handsMapPtr.advanced(by: trackingOffset + 240).storeBytes(of: jc.rightVelocityY, as: Float.self)
-                    handsMapPtr.advanced(by: trackingOffset + 244).storeBytes(of: jc.rightVelocityZ, as: Float.self)
-                    handsMapPtr.advanced(by: trackingOffset + 248).storeBytes(of: jc.leftVelocityX, as: Float.self)
-                    handsMapPtr.advanced(by: trackingOffset + 252).storeBytes(of: jc.leftVelocityY, as: Float.self)
-                    handsMapPtr.advanced(by: trackingOffset + 256).storeBytes(of: jc.leftVelocityZ, as: Float.self)
+                    // SharedHands offsets:
+                    // 0-191: Matrices
+                    // 192-195: Pinch & Triggers
+                    // 196: rightButtons, 200: leftButtons
+                    // 204: rightStickX, 208: rightStickY, 212: leftStickX, 216: leftStickY
+                    // 220: rightVel, 232: leftVel
+                    handsMapPtr.advanced(by: 196).storeBytes(of: jc.rightButtons, as: UInt32.self)
+                    handsMapPtr.advanced(by: 200).storeBytes(of: jc.leftButtons, as: UInt32.self)
+                    handsMapPtr.advanced(by: 204).storeBytes(of: jc.rightStickX, as: Float.self)
+                    handsMapPtr.advanced(by: 208).storeBytes(of: jc.rightStickY, as: Float.self)
+                    handsMapPtr.advanced(by: 212).storeBytes(of: jc.leftStickX, as: Float.self)
+                    handsMapPtr.advanced(by: 216).storeBytes(of: jc.leftStickY, as: Float.self)
+                    handsMapPtr.advanced(by: 220).storeBytes(of: jc.rightVelocityX, as: Float.self)
+                    handsMapPtr.advanced(by: 224).storeBytes(of: jc.rightVelocityY, as: Float.self)
+                    handsMapPtr.advanced(by: 228).storeBytes(of: jc.rightVelocityZ, as: Float.self)
+                    handsMapPtr.advanced(by: 232).storeBytes(of: jc.leftVelocityX, as: Float.self)
+                    handsMapPtr.advanced(by: 236).storeBytes(of: jc.leftVelocityY, as: Float.self)
+                    handsMapPtr.advanced(by: 240).storeBytes(of: jc.leftVelocityZ, as: Float.self)
                 }
             }
         }
@@ -334,6 +379,8 @@ print("Published Bonjour _verantyxvr._udp on port 9999. Waiting for Vision Pro c
 
 struct VRPosePacket {
     var magic: UInt32 // 0x45534F50 ("POSE" little endian)
+    var padding: UInt32
+    var timestamp: Double
     var headTransform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
     var leftHandTransform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
     var rightHandTransform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
@@ -343,68 +390,51 @@ struct VRPosePacket {
 
 // Receive loop using POSIX socket on port 9999
 DispatchQueue.global(qos: .userInteractive).async {
-    let recvSock = socket(AF_INET, SOCK_DGRAM, 0)
-    var opt: Int32 = 1
-    setsockopt(recvSock, SOL_SOCKET, SO_REUSEADDR, &opt, socklen_t(MemoryLayout<Int32>.size))
-    
-    var bindAddr = sockaddr_in()
-    bindAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    bindAddr.sin_family = sa_family_t(AF_INET)
-    bindAddr.sin_port = in_port_t(9999).bigEndian
-    bindAddr.sin_addr.s_addr = INADDR_ANY
-    
-    let bindResult = withUnsafePointer(to: &bindAddr) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            bind(recvSock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-    }
-    
-    if bindResult < 0 {
-        print("Failed to bind recvSock to 9999")
-        return
-    }
-    
     var buffer = [UInt8](repeating: 0, count: 2048)
     while true {
         var senderAddr = sockaddr()
         var senderLen = socklen_t(MemoryLayout<sockaddr>.size)
-        let bytesRead = recvfrom(recvSock, &buffer, buffer.count, 0, &senderAddr, &senderLen)
+        let bytesRead = recvfrom(sock, &buffer, buffer.count, 0, &senderAddr, &senderLen)
         
-        if bytesRead >= 198 {
+        if bytesRead >= 210 {
             buffer.withUnsafeBytes { rawBuffer in
-                let posePkt = rawBuffer.load(as: VRPosePacket.self)
-                if posePkt.magic == UInt32(0x45534F50) || posePkt.magic == UInt32(0x504F5345) { // "POSE"
-                    let trackingOffset = 16 + 4096 * 4096 * 4 // 67108880
+                guard let baseAddr = rawBuffer.baseAddress else { return }
+                var magic: UInt32 = 0
+                memcpy(&magic, baseAddr, 4)
+
+                if magic == 0x45534F50 || magic == 0x504F5345 { // "POSE"
+                    // Vision Pro payload: magic(4) + pad(4) + ts(8) = 16 bytes offset
+                    memcpy(handsMapPtr, baseAddr + 16, 64)       // Head (offset 0)
+                    memcpy(handsMapPtr + 64, baseAddr + 80, 64)  // Left (offset 64)
+                    memcpy(handsMapPtr + 128, baseAddr + 144, 64)// Right (offset 128)
                     
-                    _ = withUnsafePointer(to: posePkt.headTransform) { headPtr in
-                        memcpy(handsMapPtr + trackingOffset + 16, headPtr, 64)
-                    }
-                    _ = withUnsafePointer(to: posePkt.leftHandTransform) { leftPtr in
-                        memcpy(handsMapPtr + trackingOffset + 80, leftPtr, 64)
-                    }
-                    _ = withUnsafePointer(to: posePkt.rightHandTransform) { rightPtr in
-                        memcpy(handsMapPtr + trackingOffset + 144, rightPtr, 64)
-                    }
-                    handsMapPtr.advanced(by: trackingOffset + 208).storeBytes(of: posePkt.leftPinch, as: UInt8.self)
-                    handsMapPtr.advanced(by: trackingOffset + 209).storeBytes(of: posePkt.rightPinch, as: UInt8.self)
+                    let visionLeftPinch = baseAddr.load(fromByteOffset: 208, as: UInt8.self)
+                    let visionRightPinch = baseAddr.load(fromByteOffset: 209, as: UInt8.self)
+                    let visionLeftTrigger = baseAddr.load(fromByteOffset: 210, as: UInt8.self)
+                    let visionRightTrigger = baseAddr.load(fromByteOffset: 211, as: UInt8.self)
                     
-                    let ts = Date().timeIntervalSince1970
-                    handsMapPtr.advanced(by: trackingOffset).storeBytes(of: ts, as: Double.self)
+                    handsMapPtr.advanced(by: 192).storeBytes(of: visionLeftPinch, as: UInt8.self)
+                    handsMapPtr.advanced(by: 193).storeBytes(of: visionRightPinch, as: UInt8.self)
+                    handsMapPtr.advanced(by: 194).storeBytes(of: visionLeftTrigger, as: UInt8.self)
+                    handsMapPtr.advanced(by: 195).storeBytes(of: visionRightTrigger, as: UInt8.self)
                     
-                    if targetIP == "127.0.0.1" || targetIP == "" {
-                        var ipStr = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                        let senderAddrIn = withUnsafePointer(to: &senderAddr) {
-                            $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
-                        }
-                        var sin_addr = senderAddrIn.sin_addr
-                        inet_ntop(AF_INET, &sin_addr, &ipStr, socklen_t(INET_ADDRSTRLEN))
-                        targetIP = String(cString: ipStr)
+                    var ipStr = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                    let senderAddrIn = withUnsafePointer(to: &senderAddr) {
+                        $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+                    }
+                    var sin_addr = senderAddrIn.sin_addr
+                    inet_ntop(AF_INET, &sin_addr, &ipStr, socklen_t(INET_ADDRSTRLEN))
+                    let currentSenderIP = String(cString: ipStr)
+                    
+                    if targetIP != currentSenderIP && currentSenderIP != "127.0.0.1" && currentSenderIP != "" {
+                        targetIP = currentSenderIP
                         print("Auto-discovered Vision Pro IP: \(targetIP)")
-                        
-                        targetAddr.sin_addr.s_addr = inet_addr(targetIP)
-                        // Make sure video is sent to the same port Vision Pro connects FROM
-                        targetAddr.sin_port = senderAddrIn.sin_port
                     }
+                    
+                    // Always update the target port to match the latest packet,
+                    // because Vision Pro NWConnection changes source ports upon reconnection!
+                    targetAddr.sin_addr.s_addr = inet_addr(targetIP)
+                    targetAddr.sin_port = senderAddrIn.sin_port
                 }
             }
         }
@@ -415,70 +445,75 @@ print("Published Bonjour _verantyxvr._udp. Waiting for Vision Pro connection (AW
 print("Starting native read loop and UDP transmission on port 9999...")
 
 while isEncoding {
-    let currentSeq = headerPtr.pointee.sequenceNumber
-    if currentSeq != lastSeq && currentSeq > 0 {
-        let width = Int(headerPtr.pointee.width)
-        let height = Int(headerPtr.pointee.height)
-        
-        if width != currentWidth || height != currentHeight {
-            if compressionSession != nil {
-                VTCompressionSessionInvalidate(compressionSession!)
-                compressionSession = nil
-            }
-            pixelBuffer = nil
-            currentWidth = width
-            currentHeight = height
-            print("Resolution changed to \(width)x\(height)")
-        }
-        
-        if compressionSession == nil && width > 0 && height > 0 {
-            print("Initializing VideoToolbox encoder for \(width)x\(height)...")
-            fflush(stdout)
-            setupEncoder(width: Int32(width), height: Int32(height))
-        }
-        
-        if width > 0 && height > 0 {
-            if pixelBuffer == nil {
-                CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
+    autoreleasepool {
+        let currentSeq = headerPtr.pointee.sequenceNumber
+        if currentSeq != lastSeq && currentSeq > 0 {
+            let width = Int(headerPtr.pointee.width)
+            let height = Int(headerPtr.pointee.height)
+            
+            if width != currentWidth || height != currentHeight {
+                if compressionSession != nil {
+                    VTCompressionSessionInvalidate(compressionSession!)
+                    compressionSession = nil
+                }
+                pixelBuffer = nil
+                currentWidth = width
+                currentHeight = height
+                print("Resolution changed to \(width)x\(height)")
             }
             
-            if let pb = pixelBuffer {
-                CVPixelBufferLockBaseAddress(pb, [])
-                let dst = CVPixelBufferGetBaseAddress(pb)!
-                let bytesPerRow = CVPixelBufferGetBytesPerRow(pb)
-                
-                if bytesPerRow == width * 4 {
-                    memcpy(dst, pixelPtr, width * height * 4)
-                } else {
-                    for y in 0..<height {
-                        memcpy(dst + y * bytesPerRow, pixelPtr + y * width * 4, width * 4)
-                    }
+            if compressionSession == nil && width > 0 && height > 0 {
+                print("Initializing VideoToolbox encoder for \(width)x\(height)...")
+                fflush(stdout)
+                setupEncoder(width: Int32(width), height: Int32(height))
+            }
+            
+            if width > 0 && height > 0 {
+                if pixelBuffer == nil {
+                    CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
                 }
                 
-                CVPixelBufferUnlockBaseAddress(pb, [])
-                
-                let presentationTime = CMTime(value: CMTimeValue(framesEncoded), timescale: 90)
-                currentFrameSequence = currentSeq
-                
-                var refConVal = currentSeq
-                
-                let status = VTCompressionSessionEncodeFrame(compressionSession!,
-                                                             imageBuffer: pb,
-                                                             presentationTimeStamp: presentationTime,
-                                                             duration: CMTime.invalid,
-                                                             frameProperties: nil,
-                                                             sourceFrameRefcon: &refConVal,
-                                                             infoFlagsOut: nil)
-                if status == noErr {
+                if let pb = pixelBuffer {
+                    CVPixelBufferLockBaseAddress(pb, [])
+                    let dst = CVPixelBufferGetBaseAddress(pb)!
+                    let bytesPerRow = CVPixelBufferGetBytesPerRow(pb)
+                    
+                    if bytesPerRow == width * 4 {
+                        memcpy(dst, pixelPtr, width * height * 4)
+                    } else {
+                        for y in 0..<height {
+                            memcpy(dst + y * bytesPerRow, pixelPtr + y * width * 4, width * 4)
+                        }
+                    }
+                    
+                    CVPixelBufferUnlockBaseAddress(pb, [])
+                    
+                    let presentationTime = CMTime(value: CMTimeValue(framesEncoded), timescale: 90)
+                    currentFrameSequence = currentSeq
+                    
+                    let refConPtr = UnsafeMutablePointer<UInt32>.allocate(capacity: 1)
+                    refConPtr.initialize(to: currentSeq)
+                    
+                    let status = VTCompressionSessionEncodeFrame(compressionSession!,
+                                                                 imageBuffer: pb,
+                                                                 presentationTimeStamp: presentationTime,
+                                                                 duration: CMTime.invalid,
+                                                                 frameProperties: nil,
+                                                                 sourceFrameRefcon: UnsafeMutableRawPointer(refConPtr),
+                                                                 infoFlagsOut: nil)
+                    
+                    if status != noErr {
+                        print("VTCompressionSessionEncodeFrame failed: \(status)")
+                        refConPtr.deinitialize(count: 1)
+                        refConPtr.deallocate()
+                    }
+                    
                     framesEncoded += 1
-                } else {
-                    print("VTCompressionSessionEncodeFrame failed with status: \(status)")
-                    fflush(stdout)
                 }
             }
+            
+            lastSeq = currentSeq
         }
-        lastSeq = currentSeq
     }
-    
     usleep(1000)
 }

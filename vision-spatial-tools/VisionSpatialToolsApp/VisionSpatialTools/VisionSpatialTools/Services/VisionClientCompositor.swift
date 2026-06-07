@@ -178,6 +178,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         assemblers[seq] = assembler
         
         if assembler.chunksReceived == assembler.expectedChunks {
+            print("[VisionClient] SUCCESS: Assembled FULL frame \(seq) with \(totalChunks) chunks!")
             let completeFrame = assembler.frameBuffer.subdata(in: 0..<assembler.maxFrameSize)
             
             // Queue the frame for sequential decoding
@@ -193,9 +194,10 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
                 lastDecodedSeq = seq - 1
             }
             
-            // If the next expected frame is missing for too long (e.g., 3 frames behind currentSeq), skip it!
-            if currentSeq > lastDecodedSeq + 3 {
-                lastDecodedSeq = currentSeq - 3
+            // If the next expected frame is missing for too long (e.g., 30 frames behind currentSeq), skip it!
+            // We MUST wait for keyframes because if we skip a keyframe, all subsequent P-frames will fail with -17694 (ReferenceMissing)
+            if currentSeq > lastDecodedSeq + 30 {
+                lastDecodedSeq = currentSeq - 30
             }
             
             // Decode all queued frames in strict sequential order
@@ -207,7 +209,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
             
             // Clean up old assemblers and queued frames
             assemblers.removeValue(forKey: seq)
-            let keysToRemove = assemblers.keys.filter { $0 < currentSeq && (currentSeq - $0 > 5) }
+            let keysToRemove = assemblers.keys.filter { $0 < currentSeq && (currentSeq - $0 > 30) }
             for k in keysToRemove { assemblers.removeValue(forKey: k) }
             
             let staleFrames = readyToDecodeQueue.keys.filter { $0 < lastDecodedSeq }
@@ -222,7 +224,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
     
     // MARK: - Pose Upload
     
-    public func sendPose(head: simd_float4x4, leftHand: simd_float4x4, rightHand: simd_float4x4, leftPinch: Bool, rightPinch: Bool) {
+    public func sendPose(head: simd_float4x4, leftHand: simd_float4x4, rightHand: simd_float4x4, leftPinch: Bool, rightPinch: Bool, leftTrigger: Bool, rightTrigger: Bool) {
         guard isTrackingConnectionReady, let trackingConnection = trackingConnection else { return }
         
         var packetData = Data()
@@ -258,9 +260,13 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         
         var lPinch: UInt8 = leftPinch ? 1 : 0
         var rPinch: UInt8 = rightPinch ? 1 : 0
+        var lTrig: UInt8 = leftTrigger ? 1 : 0
+        var rTrig: UInt8 = rightTrigger ? 1 : 0
         
         packetData.append(Data(bytes: &lPinch, count: 1))
         packetData.append(Data(bytes: &rPinch, count: 1))
+        packetData.append(Data(bytes: &lTrig, count: 1))
+        packetData.append(Data(bytes: &rTrig, count: 1))
         
         trackingConnection.send(content: packetData, completion: .contentProcessed({ error in
             if let error = error {
