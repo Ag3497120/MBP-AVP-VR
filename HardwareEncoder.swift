@@ -179,9 +179,18 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
             packet.append(baseAddress + chunkOffset, count: fragSize)
             
             packet.withUnsafeBytes { rawBytes in
-                let _ = sendto(sock, rawBytes.baseAddress, packet.count, 0, withUnsafePointer(to: &targetAddr) {
-                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 }
-                }, socklen_t(MemoryLayout<sockaddr_in>.size))
+                if targetAddrLen > 0 {
+                    let _ = sendto(sock, rawBytes.baseAddress, packet.count, 0, withUnsafePointer(to: &targetAddr) {
+                        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 }
+                    }, targetAddrLen)
+                }
+            }
+            
+            // Smart Pacing: Send 20 packets (~28KB) instantly, then yield for 1ms.
+            // P-frames (typically <20 packets) will transmit in 0ms.
+            // I-frames (~700 packets) will transmit smoothly over ~35ms without overflowing the Vision Pro network buffer!
+            if i % 20 == 19 {
+                usleep(1000)
             }
         }
     }
@@ -189,21 +198,24 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
 
 // MARK: - VideoToolbox Setup
 
-var targetIP = "192.168.1.255"
+var targetIP = ""
 
-var sock = socket(AF_INET, SOCK_DGRAM, 0)
+var sock = socket(AF_INET6, SOCK_DGRAM, 0)
 var opt: Int32 = 1
 setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, socklen_t(MemoryLayout<Int32>.size))
 
-var bindAddr = sockaddr_in()
-bindAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-bindAddr.sin_family = sa_family_t(AF_INET)
-bindAddr.sin_port = in_port_t(9999).bigEndian
-bindAddr.sin_addr.s_addr = INADDR_ANY
+var v6only: Int32 = 0
+setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, socklen_t(MemoryLayout<Int32>.size))
+
+var bindAddr = sockaddr_in6()
+bindAddr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+bindAddr.sin6_family = sa_family_t(AF_INET6)
+bindAddr.sin6_port = in_port_t(9999).bigEndian
+bindAddr.sin6_addr = in6addr_any
 
 let bindResult = withUnsafePointer(to: &bindAddr) {
     $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
     }
 }
 
@@ -212,11 +224,8 @@ if bindResult < 0 {
     exit(1)
 }
 
-var targetAddr = sockaddr_in()
-targetAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-targetAddr.sin_family = sa_family_t(AF_INET)
-targetAddr.sin_port = in_port_t(9999).bigEndian
-targetAddr.sin_addr.s_addr = inet_addr(targetIP)
+var targetAddr = sockaddr_storage()
+var targetAddrLen: socklen_t = 0
 
 var compressionSession: VTCompressionSession?
 var isEncoding = true
@@ -260,12 +269,16 @@ func setupEncoder(width: Int32, height: Int32) {
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main_AutoLevel)
     
-    var bitrate: Int32 = 10_000_000 // 10 Mbps
+    // Critical settings for ultra-low latency VR streaming
+    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse) // Disable B-frames
+    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
+    
+    var bitrate: Int32 = 15_000_000 // Bump to 15 Mbps for higher quality since we use fewer I-frames
     let bitrateNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &bitrate)
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateNum)
     
-    // Force a keyframe every 30 frames (0.5 seconds at 60fps) to quickly recover from UDP packet loss
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 30 as CFNumber)
+    // Avoid network spikes by only sending an I-frame once every 10 seconds (900 frames)
+    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 900 as CFNumber)
     
     VTCompressionSessionPrepareToEncodeFrames(compressionSession!)
 }
@@ -389,9 +402,14 @@ struct VRPosePacket {
 DispatchQueue.global(qos: .userInteractive).async {
     var buffer = [UInt8](repeating: 0, count: 2048)
     while true {
-        var senderAddr = sockaddr()
-        var senderLen = socklen_t(MemoryLayout<sockaddr>.size)
-        let bytesRead = recvfrom(sock, &buffer, buffer.count, 0, &senderAddr, &senderLen)
+        var senderAddr = sockaddr_storage()
+        var senderLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        
+        let bytesRead = withUnsafeMutablePointer(to: &senderAddr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                recvfrom(sock, &buffer, buffer.count, 0, $0, &senderLen)
+            }
+        }
         
         if bytesRead >= 210 {
             buffer.withUnsafeBytes { rawBuffer in
@@ -415,23 +433,31 @@ DispatchQueue.global(qos: .userInteractive).async {
                     handsMapPtr.advanced(by: 194).storeBytes(of: visionLeftTrigger, as: UInt8.self)
                     handsMapPtr.advanced(by: 195).storeBytes(of: visionRightTrigger, as: UInt8.self)
                     
-                    var ipStr = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                    let senderAddrIn = withUnsafePointer(to: &senderAddr) {
-                        $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+                    var ipStr = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                    if senderAddr.ss_family == sa_family_t(AF_INET6) {
+                        let senderAddrIn6 = withUnsafePointer(to: &senderAddr) {
+                            $0.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee }
+                        }
+                        var sin6_addr = senderAddrIn6.sin6_addr
+                        inet_ntop(AF_INET6, &sin6_addr, &ipStr, socklen_t(INET6_ADDRSTRLEN))
+                    } else if senderAddr.ss_family == sa_family_t(AF_INET) {
+                        let senderAddrIn = withUnsafePointer(to: &senderAddr) {
+                            $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+                        }
+                        var sin_addr = senderAddrIn.sin_addr
+                        inet_ntop(AF_INET, &sin_addr, &ipStr, socklen_t(INET_ADDRSTRLEN))
                     }
-                    var sin_addr = senderAddrIn.sin_addr
-                    inet_ntop(AF_INET, &sin_addr, &ipStr, socklen_t(INET_ADDRSTRLEN))
+                    
                     let currentSenderIP = String(cString: ipStr)
                     
-                    if targetIP != currentSenderIP && currentSenderIP != "127.0.0.1" && currentSenderIP != "" {
+                    if targetIP != currentSenderIP && currentSenderIP != "127.0.0.1" && currentSenderIP != "::1" && currentSenderIP != "" {
                         targetIP = currentSenderIP
                         print("Auto-discovered Vision Pro IP: \(targetIP)")
                     }
                     
-                    // Always update the target port to match the latest packet,
-                    // because Vision Pro NWConnection changes source ports upon reconnection!
-                    targetAddr.sin_addr.s_addr = inet_addr(targetIP)
-                    targetAddr.sin_port = senderAddrIn.sin_port
+                    // Store the entire sockaddr_storage to respond exactly to the same address/port
+                    targetAddr = senderAddr
+                    targetAddrLen = senderLen
                 }
             }
         }

@@ -61,7 +61,9 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         trackingConnection = nil
         
         let trackingParams = NWParameters.udp
+        trackingParams.includePeerToPeer = true
         let joyconParams = NWParameters.udp
+        joyconParams.includePeerToPeer = true
         
         let targetIP = ip
         let endpoint: NWEndpoint
