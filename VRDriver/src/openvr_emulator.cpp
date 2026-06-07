@@ -323,7 +323,9 @@ public:
         return false;
     }
     virtual bool GetBoolTrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
-        LogMsg("Called: IVRSystem::GetBoolTrackedDeviceProperty\n");
+        FILE* f = fopen("vr_emulator_log.txt", "a");
+        if(f) { fprintf(f, "Called: IVRSystem::GetBoolTrackedDeviceProperty prop=%d\n", (int)prop); fclose(f); }
+        if (prop == vr::Prop_DeviceProvidesBatteryStatus_Bool || prop == vr::Prop_ContainsProximitySensor_Bool) return true;
         return false;
     }
     virtual float GetFloatTrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
@@ -410,8 +412,9 @@ public:
         if (count == 0) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)100; pEvent->trackedDeviceIndex = 0; } return true; }
         else if (count == 1) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)100; pEvent->trackedDeviceIndex = 1; } return true; }
         else if (count == 2) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)100; pEvent->trackedDeviceIndex = 2; } return true; }
-        else if (count == 3) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)403; pEvent->trackedDeviceIndex = 0; } return true; }
-
+        else if (count == 3) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)103; pEvent->trackedDeviceIndex = 0; } return true; } // UserInteractionStarted
+        else if (count == 4) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)200; pEvent->trackedDeviceIndex = 0; pEvent->data.controller.button = 31; } return true; } // Proximity ButtonPress
+        else if (count == 5) { count++; if(pEvent) { memset(pEvent, 0, uncbVREvent); pEvent->eventType = (vr::EVREventType)403; pEvent->trackedDeviceIndex = 0; } return true; }
         static uint64_t lastLeftVRButtons = 0;
         static uint64_t lastRightVRButtons = 0;
         
@@ -485,7 +488,9 @@ public:
             if (pSharedHands) {
                 uint32_t lb = pSharedHands->leftButtons;
                 uint32_t rb = pSharedHands->rightButtons;
-                if (unControllerDeviceIndex == 1) {
+                if (unControllerDeviceIndex == 0) {
+                    pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_ProximitySensor);
+                } else if (unControllerDeviceIndex == 1) {
                     if (pSharedHands->leftPinch) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
                     if ((lb & (1<<4)) || pSharedHands->leftTrigger) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } // ZL or Hand Trigger
                     if (lb & (1<<5)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // L3
@@ -1408,11 +1413,13 @@ public:
                             pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][3] -= 0.3f;
                         }
                     } else {
-                        // Identity fallback at 1.5m height
+                        // Safe offset fallback
                         pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1.0f;
                         pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1.0f;
                         pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1.0f;
-                        pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.5f;
+                        if (i == 0) { pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.5f; }
+                        else if (i == 1) { pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][3] = -0.2f; pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.3f; pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][3] = -0.3f; }
+                        else if (i == 2) { pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][3] = 0.2f; pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.3f; pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][3] = -0.3f; }
                     }
                 }
             }
@@ -1441,11 +1448,13 @@ public:
                             pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][3] -= 0.3f;
                         }
                     } else {
-                        // Identity fallback at 1.5m height
+                        // Safe offset fallback
                         pGamePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1.0f;
                         pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1.0f;
                         pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1.0f;
-                        pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.5f; // 1.5 meters high
+                        if (i == 0) { pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.5f; }
+                        else if (i == 1) { pGamePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] = -0.2f; pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.3f; pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][3] = -0.3f; }
+                        else if (i == 2) { pGamePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] = 0.2f; pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.3f; pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][3] = -0.3f; }
                     }
                 }
             }
@@ -1486,7 +1495,14 @@ public:
         }
         lastTime = now;
         
-        Sleep(11);
+        static DWORD lastWaitTime = GetTickCount();
+        DWORD nowWait = GetTickCount();
+        DWORD elapsed = nowWait - lastWaitTime;
+        if (elapsed < 11) {
+            Sleep(11 - elapsed);
+        }
+        lastWaitTime = GetTickCount();
+        
         return vr::VRCompositorError_None;
     }
     virtual EVRCompositorError GetLastPoses(VR_ARRAY_COUNT( unRenderPoseArrayCount ) TrackedDevicePose_t* pRenderPoseArray, uint32_t unRenderPoseArrayCount, VR_ARRAY_COUNT( unGamePoseArrayCount ) TrackedDevicePose_t* pGamePoseArray, uint32_t unGamePoseArrayCount) override {
@@ -1513,7 +1529,7 @@ public:
                     if (pContext) {
                         ID3D11Multithread* pMt = nullptr;
                         pContext->QueryInterface(__uuidof(ID3D11Multithread), (void**)&pMt);
-                        if (pMt) pMt->Enter();
+                        if (pMt) { pMt->SetMultithreadProtected(TRUE); pMt->Enter(); }
 
                         bool needsRecreate = false;
                         if (pStagingTexture) {
@@ -1619,9 +1635,7 @@ public:
     virtual void FadeToColor(float fSeconds, float fRed, float fGreen, float fBlue, float fAlpha, bool bBackground = false) override {
         LogMsg("Called: IVRCompositor::FadeToColor\n");
     }
-    virtual void GetCurrentFadeColor(HmdColor_t *pRet, bool bBackground = false) override {
-        if(pRet) { memset(pRet, 0, sizeof(*pRet)); }
-    }
+    virtual void GetCurrentFadeColor(HmdColor_t *pRet, bool bBackground = false) override { if(pRet) { memset(pRet, 0, sizeof(*pRet)); } }
     virtual void FadeGrid(float fSeconds, bool bFadeIn) override {
         LogMsg("Called: IVRCompositor::FadeGrid\n");
     }
@@ -4368,7 +4382,7 @@ extern "C" __declspec(dllexport) bool VR_IsRuntimeInstalled() { return true; }
 
 #include "iat_hook.h"
 #include <d3d11_4.h> // Include proper header for ID3D11Multithread
-#include "MinHook.h"
+
 
 /* REMOVED_LOGMSG */ void OldLogMsg(const char* msg) {
     HANDLE hFile = CreateFileA("vr_emulator_log.txt", FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -4381,149 +4395,7 @@ extern "C" __declspec(dllexport) bool VR_IsRuntimeInstalled() { return true; }
 
 
 // --- COM VTABLE HOOKING ---
-typedef HRESULT (WINAPI *CreateTexture2D_t)(ID3D11Device* This, const D3D11_TEXTURE2D_DESC* pDesc, const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D);
-typedef HRESULT (WINAPI *CreateSwapChain_t)(IDXGIFactory* This, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain);
-
-CreateTexture2D_t g_pOriginalCreateTexture2D = nullptr;
-CreateSwapChain_t g_pOriginalCreateSwapChain = nullptr;
-
-__attribute__((force_align_arg_pointer))
-HRESULT WINAPI Hooked_CreateTexture2D(ID3D11Device* This, const D3D11_TEXTURE2D_DESC* pDesc, const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D) {
-    static bool bMtEnabled = false;
-    if (!bMtEnabled) {
-        bMtEnabled = true;
-        ID3D11Multithread* pMt = nullptr;
-        if (SUCCEEDED(This->QueryInterface(__uuidof(ID3D11Multithread), (void**)&pMt)) && pMt) {
-            pMt->SetMultithreadProtected(TRUE);
-            pMt->Release();
-            FILE* _f = fopen("vr_emulator_log.txt", "a");
-            if (_f) { fprintf(_f, "[Verantyx] ID3D11Device::CreateTexture2D HOOK: Multithreading Enabled!\n"); fclose(_f); }
-        }
-    }
-    D3D11_TEXTURE2D_DESC newDesc = *pDesc;
-    if (newDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED) {
-        newDesc.MiscFlags &= ~D3D11_RESOURCE_MISC_SHARED;
-        FILE* _f = fopen("vr_emulator_log.txt", "a");
-        if (_f) { fprintf(_f, "[Verantyx] Stripped D3D11_RESOURCE_MISC_SHARED from Texture2D\n"); fclose(_f); }
-    }
-    if (newDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) {
-        newDesc.MiscFlags &= ~D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
-    }
-    return g_pOriginalCreateTexture2D(This, &newDesc, pInitialData, ppTexture2D);
-}
-
-__attribute__((force_align_arg_pointer))
-HRESULT WINAPI Hooked_CreateSwapChain(IDXGIFactory* This, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain) {
-    if (pDevice) {
-        ID3D11Multithread* pMt = nullptr;
-        if (SUCCEEDED(pDevice->QueryInterface(__uuidof(ID3D11Multithread), (void**)&pMt)) && pMt) {
-            pMt->SetMultithreadProtected(TRUE);
-            pMt->Release();
-            FILE* _f = fopen("vr_emulator_log.txt", "a");
-            if (_f) { fprintf(_f, "[Verantyx] IDXGIFactory::CreateSwapChain HOOK: Multithreading Enabled!\n"); fclose(_f); }
-        }
-    }
-    return g_pOriginalCreateSwapChain(This, pDevice, pDesc, ppSwapChain);
-}
-
-typedef HRESULT (WINAPI *CreateBuffer_t)(ID3D11Device* This, const D3D11_BUFFER_DESC* pDesc, const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Buffer** ppBuffer);
-typedef HRESULT (WINAPI *CreateSwapChainForHwnd_t)(IUnknown* This, IUnknown* pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1* pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc, IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain);
-
-CreateBuffer_t g_pOriginalCreateBuffer = nullptr;
-CreateSwapChainForHwnd_t g_pOriginalCreateSwapChainForHwnd = nullptr;
-
-__attribute__((force_align_arg_pointer))
-HRESULT WINAPI Hooked_CreateBuffer(ID3D11Device* This, const D3D11_BUFFER_DESC* pDesc, const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Buffer** ppBuffer) {
-    static bool bMtEnabled = false;
-    if (!bMtEnabled) {
-        bMtEnabled = true;
-        ID3D11Multithread* pMt = nullptr;
-        if (SUCCEEDED(This->QueryInterface(__uuidof(ID3D11Multithread), (void**)&pMt)) && pMt) {
-            pMt->SetMultithreadProtected(TRUE);
-            pMt->Release();
-            FILE* _f = fopen("vr_emulator_log.txt", "a");
-            if (_f) { fprintf(_f, "[Verantyx] ID3D11Device::CreateBuffer HOOK: Multithreading Enabled!\n"); fclose(_f); }
-        }
-    }
-    return g_pOriginalCreateBuffer(This, pDesc, pInitialData, ppBuffer);
-}
-
-__attribute__((force_align_arg_pointer))
-HRESULT WINAPI Hooked_CreateSwapChainForHwnd(IUnknown* This, IUnknown* pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1* pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc, IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain) {
-    if (pDevice) {
-        ID3D11Multithread* pMt = nullptr;
-        if (SUCCEEDED(pDevice->QueryInterface(__uuidof(ID3D11Multithread), (void**)&pMt)) && pMt) {
-            pMt->SetMultithreadProtected(TRUE);
-            pMt->Release();
-            FILE* _f = fopen("vr_emulator_log.txt", "a");
-            if (_f) { fprintf(_f, "[Verantyx] IDXGIFactory2::CreateSwapChainForHwnd HOOK: Multithreading Enabled!\n"); fclose(_f); }
-        }
-    }
-    return g_pOriginalCreateSwapChainForHwnd(This, pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
-}
-
-void ApplyCOMHooks() {
-    static bool bInjected = false;
-    if (bInjected) return;
-    bInjected = true;
-
-    MH_Initialize();
-
-    HMODULE hD3D11 = LoadLibraryA("d3d11.dll");
-    HMODULE hDXGI = LoadLibraryA("dxgi.dll");
-
-    if (hD3D11 && hDXGI) {
-        typedef HRESULT (WINAPI *D3D11CreateDevice_t)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL*, UINT, UINT, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
-        D3D11CreateDevice_t pD3D11CreateDevice = (D3D11CreateDevice_t)GetProcAddress(hD3D11, "D3D11CreateDevice");
-
-        typedef HRESULT (WINAPI *CreateDXGIFactory1_t)(REFIID riid, void **ppFactory);
-        CreateDXGIFactory1_t pCreateDXGIFactory1 = (CreateDXGIFactory1_t)GetProcAddress(hDXGI, "CreateDXGIFactory1");
-
-        if (pD3D11CreateDevice) {
-            ID3D11Device* pDummyDevice = nullptr;
-            ID3D11DeviceContext* pDummyContext = nullptr;
-            D3D_FEATURE_LEVEL featureLevel;
-            if (SUCCEEDED(pD3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &pDummyDevice, &featureLevel, &pDummyContext)) && pDummyDevice) {
-                void** pVTable = *(void***)pDummyDevice;
-                
-                void* pCreateBuffer = pVTable[3];
-                void* pCreateTexture2D = pVTable[5];
-                
-                MH_CreateHook(pCreateBuffer, (void*)Hooked_CreateBuffer, (LPVOID*)&g_pOriginalCreateBuffer);
-                MH_CreateHook(pCreateTexture2D, (void*)Hooked_CreateTexture2D, (LPVOID*)&g_pOriginalCreateTexture2D);
-                
-                pDummyDevice->Release();
-                if(pDummyContext) pDummyContext->Release();
-            }
-        }
-
-        if (pCreateDXGIFactory1) {
-            IDXGIFactory1* pFactory = nullptr;
-            if (SUCCEEDED(pCreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&pFactory)) && pFactory) {
-                void** pFactoryVTable = *(void***)pFactory;
-                void* pCreateSwapChain = pFactoryVTable[10];
-                MH_CreateHook(pCreateSwapChain, (void*)Hooked_CreateSwapChain, (LPVOID*)&g_pOriginalCreateSwapChain);
-                
-                // Try to get IDXGIFactory2 for CreateSwapChainForHwnd
-                IUnknown* pFactory2 = nullptr;
-                // IID_IDXGIFactory2 is 50c83a1c-e072-4c48-87b0-3630fa36a6d0
-                static const GUID IID_IDXGIFactory2_Verantyx = { 0x50c83a1c, 0xe072, 0x4c48, { 0x87, 0xb0, 0x36, 0x30, 0xfa, 0x36, 0xa6, 0xd0 } };
-                if (SUCCEEDED(pFactory->QueryInterface(IID_IDXGIFactory2_Verantyx, (void**)&pFactory2)) && pFactory2) {
-                    void** pFactory2VTable = *(void***)pFactory2;
-                    void* pCreateSwapChainForHwnd = pFactory2VTable[15];
-                    MH_CreateHook(pCreateSwapChainForHwnd, (void*)Hooked_CreateSwapChainForHwnd, (LPVOID*)&g_pOriginalCreateSwapChainForHwnd);
-                    pFactory2->Release();
-                }
-                
-                pFactory->Release();
-            }
-        }
-
-        MH_EnableHook(MH_ALL_HOOKS);
-        FILE* _f = fopen("vr_emulator_log.txt", "a");
-        if (_f) { fprintf(_f, "[Verantyx] Successfully injected COM VTable hooks (CreateBuffer, CreateTexture2D, CreateSwapChain, CreateSwapChainForHwnd)!\n"); fclose(_f); }
-    }
-}
+void ApplyCOMHooks() { }
 // --- END COM VTABLE HOOKING ---
 
 void InjectMinHook() {

@@ -183,9 +183,6 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
                     $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 }
                 }, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
-            
-            // Pace the UDP packets to prevent Vision Pro AWDL / WiFi radio buffer overflows
-            usleep(50)
         }
     }
 }

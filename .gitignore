@@ -3,3 +3,12 @@ GPTK/
 *gptk*
 *GPTK*
 .DS_Store
+
+*.exe
+*.o
+*.a
+VRDriver/src/d3d11.dll
+VRDriver/d3d11.dll
+VRDriver/dxgi.dll
+VRDriver/bin/
+VRDriver/deps/

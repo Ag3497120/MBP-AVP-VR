@@ -39,6 +39,7 @@ public:
 
     virtual HRESULT STDMETHODCALLTYPE CreateBuffer(const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, ID3D11Buffer **ppBuffer) {
         D3D11_BUFFER_DESC desc = *pDesc;
+        FILE* _ftest = fopen("C:\\d3d11_proxy_log.txt", "a"); if(_ftest){fprintf(_ftest, "CreateTexture2D Called!\n"); fclose(_ftest);}
         if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED) {
             FILE* f = fopen("C:\\d3d11_proxy_log.txt", "a");
             if(f) { fprintf(f, "Stripped D3D11_RESOURCE_MISC_SHARED from Buffer %u\n", desc.ByteWidth); fclose(f); }
@@ -51,6 +52,7 @@ public:
     
     virtual HRESULT STDMETHODCALLTYPE CreateTexture2D(const D3D11_TEXTURE2D_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, ID3D11Texture2D **ppTexture2D) {
         D3D11_TEXTURE2D_DESC desc = *pDesc;
+        FILE* _ftest = fopen("C:\\d3d11_proxy_log.txt", "a"); if(_ftest){fprintf(_ftest, "CreateTexture2D Called!\n"); fclose(_ftest);}
         if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED) {
             FILE* f = fopen("C:\\d3d11_proxy_log.txt", "a");
             if(f) { fprintf(f, "Stripped D3D11_RESOURCE_MISC_SHARED from Texture2D\n"); fclose(f); }
@@ -121,8 +123,8 @@ extern "C" __declspec(dllexport) HRESULT WINAPI D3D11CreateDevice(
     }
 
     if(f) { f = fopen("C:\\d3d11_proxy_log.txt", "a"); if(f){fprintf(f, "[Verantyx] D3D11CreateDevice overriding adapter to NULL and DriverType to HARDWARE\n"); fclose(f);} }
-    pAdapter = NULL;
-    DriverType = D3D_DRIVER_TYPE_HARDWARE;
+    // pAdapter = NULL;
+    // DriverType = D3D_DRIVER_TYPE_HARDWARE;
     Flags &= ~D3D11_CREATE_DEVICE_DEBUG;
     Flags &= ~D3D11_CREATE_DEVICE_SINGLETHREADED;
     
@@ -168,8 +170,8 @@ extern "C" __declspec(dllexport) HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
     if (!pOrig) return E_FAIL;
 
     if(f) { f = fopen("C:\\d3d11_proxy_log.txt", "a"); if(f){fprintf(f, "[Verantyx] D3D11CreateDeviceAndSwapChain overriding adapter to NULL and DriverType to HARDWARE\n"); fclose(f);} }
-    pAdapter = NULL;
-    DriverType = D3D_DRIVER_TYPE_HARDWARE;
+    // pAdapter = NULL;
+    // DriverType = D3D_DRIVER_TYPE_HARDWARE;
     Flags &= ~D3D11_CREATE_DEVICE_DEBUG;
     Flags &= ~D3D11_CREATE_DEVICE_SINGLETHREADED;
 
