@@ -13,7 +13,7 @@ import MetalKit
 /// Mac(Verantyx)からのゼロコピー映像のデコードと、JCrossトラッキング情報の送信を行うコアモジュールです。
 public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
     
-    public var onFrameDecoded: ((CVPixelBuffer) -> Void)?
+    public var onFrameDecoded: ((CVPixelBuffer, Double) -> Void)?
     
     private var listener: NWListener?
     private var trackingConnection: NWConnection?
@@ -24,10 +24,18 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
     
     // --- Chunk Assembly State ---
     private var currentSeq: UInt32 = 0
-    private var chunksReceived: UInt32 = 0
-    private var expectedChunks: UInt32 = 0
-    private var maxFrameSize: Int = 0
-    private var frameBuffer = Data()
+    private var lastDecodedSeq: UInt32 = 0
+    private var readyToDecodeQueue: [UInt32: Data] = [:]
+    
+    private struct FrameAssembler {
+        var chunksReceived: UInt32 = 0
+        var expectedChunks: UInt32 = 0
+        var maxFrameSize: Int = 0
+        var frameBuffer: Data
+        var timestamp: Double = 0.0
+    }
+    private var assemblers: [UInt32: FrameAssembler] = [:]
+    
     private var dummyBrowser: NWBrowser?
     private let networkingQueue = DispatchQueue(label: "com.verantyx.networking", qos: .userInteractive)
     
@@ -123,7 +131,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
     }
     
     private func processUDPPacket(_ data: Data) {
-        guard data.count >= 24 else { return }
+        guard data.count >= 32 else { return }
         
         let magic = data[0..<4].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
         guard magic == 0x5652414E else { return } // Match HardwareEncoder's 0x5652414E
@@ -133,59 +141,83 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         let totalChunks = data[12..<16].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
         let chunkOffset = data[16..<20].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
         let payloadSize = data[20..<24].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        let timestamp = data[24..<32].withUnsafeBytes { $0.load(as: Double.self) }
         
         // Print the first few packets unconditionally to verify reception
         if seq < 10 && chunkIdx == 0 {
-            print("[VisionClient] Received UDP packet: seq=\\(seq) chunk=\\(chunkIdx)/\\(totalChunks)")
+            print("[VisionClient] Received UDP packet: seq=\\(seq) chunk=\\(chunkIdx)/\\(totalChunks) ts=\\(timestamp)")
         } else if chunkIdx == 0 && seq % 60 == 0 {
-            print("[VisionClient] Received UDP packet: seq=\\(seq) chunk=\\(chunkIdx)/\\(totalChunks)")
+            print("[VisionClient] Received UDP packet: seq=\\(seq) chunk=\\(chunkIdx)/\\(totalChunks) ts=\\(timestamp)")
         }
         
-        if seq < currentSeq {
-            // Ignore late packets from older frames
+        if currentSeq > 5 && seq < currentSeq - 5 {
+            // Ignore very late packets from older frames
             return
         }
         
-        if seq > currentSeq {
-            currentSeq = seq
-            chunksReceived = 0
-            expectedChunks = totalChunks
-            maxFrameSize = 0
-            frameBuffer.removeAll(keepingCapacity: true)
-            // Pre-allocate to prevent array out of bounds when assembling out of order
-            frameBuffer = Data(count: Int(totalChunks * 60000)) 
-        }
+        var assembler = assemblers[seq] ?? FrameAssembler(frameBuffer: Data(count: Int(totalChunks * 1500)))
+        assembler.expectedChunks = totalChunks
+        assembler.timestamp = timestamp
         
-        let payloadData = data.subdata(in: 24..<(24 + Int(payloadSize)))
-        
-        // Place data at the exact offset
+        let payloadData = data.subdata(in: 32..<(32 + Int(payloadSize)))
         let endOffset = Int(chunkOffset) + Int(payloadSize)
-        if endOffset > maxFrameSize {
-            maxFrameSize = endOffset
+        
+        if endOffset > assembler.maxFrameSize {
+            assembler.maxFrameSize = endOffset
         }
         
-        if endOffset <= frameBuffer.count {
-            frameBuffer.replaceSubrange(Int(chunkOffset)..<endOffset, with: payloadData)
+        if endOffset <= assembler.frameBuffer.count {
+            assembler.frameBuffer.replaceSubrange(Int(chunkOffset)..<endOffset, with: payloadData)
         } else {
-            // Expand buffer if needed
-            let padding = Data(count: endOffset - frameBuffer.count)
-            frameBuffer.append(padding)
-            frameBuffer.replaceSubrange(Int(chunkOffset)..<endOffset, with: payloadData)
+            let padding = Data(count: endOffset - assembler.frameBuffer.count)
+            assembler.frameBuffer.append(padding)
+            assembler.frameBuffer.replaceSubrange(Int(chunkOffset)..<endOffset, with: payloadData)
         }
         
-        chunksReceived += 1
+        assembler.chunksReceived += 1
+        assemblers[seq] = assembler
         
-        if chunksReceived == expectedChunks {
-            // Trim buffer to actual frame size
-            let completeFrame = frameBuffer.subdata(in: 0..<maxFrameSize)
-            print("[VisionClient] Complete frame assembled! Size: \(completeFrame.count) bytes. Sending to decoder...")
-            decoder.decodeAnnexBFrame(completeFrame)
+        if assembler.chunksReceived == assembler.expectedChunks {
+            let completeFrame = assembler.frameBuffer.subdata(in: 0..<assembler.maxFrameSize)
+            
+            // Queue the frame for sequential decoding
+            readyToDecodeQueue[seq] = completeFrame
+            
+            if seq > currentSeq {
+                currentSeq = seq
+            }
+            
+            // Sequential decode logic
+            if lastDecodedSeq == 0 || seq < lastDecodedSeq {
+                // Initialize or reset (e.g. after restart)
+                lastDecodedSeq = seq - 1
+            }
+            
+            // If the next expected frame is missing for too long (e.g., 3 frames behind currentSeq), skip it!
+            if currentSeq > lastDecodedSeq + 3 {
+                lastDecodedSeq = currentSeq - 3
+            }
+            
+            // Decode all queued frames in strict sequential order
+            while let frameToDecode = readyToDecodeQueue[lastDecodedSeq + 1] {
+                lastDecodedSeq += 1
+                decoder.decodeAnnexBFrame(frameToDecode, sequence: lastDecodedSeq, timestamp: assembler.timestamp)
+                readyToDecodeQueue.removeValue(forKey: lastDecodedSeq)
+            }
+            
+            // Clean up old assemblers and queued frames
+            assemblers.removeValue(forKey: seq)
+            let keysToRemove = assemblers.keys.filter { $0 < currentSeq && (currentSeq - $0 > 5) }
+            for k in keysToRemove { assemblers.removeValue(forKey: k) }
+            
+            let staleFrames = readyToDecodeQueue.keys.filter { $0 < lastDecodedSeq }
+            for k in staleFrames { readyToDecodeQueue.removeValue(forKey: k) }
         }
     }
     
     // MARK: - HEVCVideoDecoderDelegate
-    public func didDecodeFrame(_ pixelBuffer: CVPixelBuffer) {
-        onFrameDecoded?(pixelBuffer)
+    public func didDecodeFrame(_ pixelBuffer: CVPixelBuffer, timestamp: Double) {
+        onFrameDecoded?(pixelBuffer, timestamp)
     }
     
     // MARK: - Pose Upload
@@ -198,6 +230,14 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         // magic (0x504F5345 = "POSE")
         var magic: UInt32 = 0x45534F50 // "POSE" in little endian
         packetData.append(Data(bytes: &magic, count: 4))
+        
+        // 4 bytes padding to align the Double to 8-byte boundary!
+        var padding: UInt32 = 0
+        packetData.append(Data(bytes: &padding, count: 4))
+        
+        // timestamp (CACurrentMediaTime)
+        var ts: Double = CACurrentMediaTime()
+        packetData.append(Data(bytes: &ts, count: 8))
         
         func appendMatrix(_ matrix: simd_float4x4) {
             var m = matrix
@@ -320,11 +360,11 @@ class CompositorRenderer {
                                       constant float4 *tangentsArray [[buffer(1)]],
                                       constant float4x4 *headMatrices [[buffer(2)]]) {
             
-            float4 tangents = tangentsArray[ampID];
-            float left = tangents[0];
-            float right = tangents[1];
-            float top = tangents[2];
-            float bottom = tangents[3];
+            // Fallback to exactly 1.0 to prevent Metal from clipping the quad or causing zero-area intersections
+            float left = tangentsArray[ampID].x;
+            float right = tangentsArray[ampID].y;
+            float top = tangentsArray[ampID].z;
+            float bottom = tangentsArray[ampID].w;
             
             // Quad perfectly sized to the view frustum at Z = -1
             float2 positions[6] = {
@@ -345,17 +385,16 @@ class CompositorRenderer {
                 float2(1.0, 0.0)
             };
             
-            // Draw the quad in View Space, exactly 1 meter away
+            // Quad perfectly sized to the view frustum at Z = -1
             float4 viewSpacePos = float4(positions[vertexID], -1.0, 1.0);
             
             VertexOut out;
-            // Project perfectly into OS clip space using the provided matrix
+            // Project into OS clip space directly from view space (deviceAnchor handles the 6-DOF ATW)
             out.position = projectionMatrices[ampID] * viewSpacePos;
             out.texCoord = texCoords[vertexID];
             out.eyeIndex = ampID;
             return out;
         }
-
         fragment float4 vrFragmentShader(VertexOut in [[stage_in]],
                                        texture2d<float, access::sample> videoTexture [[texture(0)]],
                                        sampler videoSampler [[sampler(0)]]) {
@@ -451,6 +490,7 @@ class CompositorRenderer {
         thread.name = "com.verantyx.renderloop"
         thread.start()
     }
+    private var lastValidAnchor: DeviceAnchor? = nil
     
     private func renderLoop() throws {
         
@@ -474,21 +514,30 @@ class CompositorRenderer {
             
             // In visionOS, we cannot use plain CACurrentMediaTime for the device anchor.
             // We must predict the exact target time using the Compositor's Clock Instant.
-            let duration = LayerRenderer.Clock.Instant.epoch.duration(to: timing.presentationTime)
-            let exactSeconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+            // We now use the exact past timestamp when the frame was rendered by SteamVR
+            let ts = self.appModel?.latestTimestamp ?? 0.0
+            let effectiveTs = ts > 0 ? ts : CACurrentMediaTime()
             
-            // 完璧な未来予測時刻で頭の位置を取得
+            // 過去のタイムスタンプを使ってATWの相殺を行う
             let predictedAnchor = worldTrackingProvider.state == .running
-                ? worldTrackingProvider.queryDeviceAnchor(atTimestamp: exactSeconds)
+                ? worldTrackingProvider.queryDeviceAnchor(atTimestamp: effectiveTs)
                 : nil
                 
-            // 未来予測時刻のアンカーが取れなかった場合は、現在時刻のアンカーでフォールバック（画面が真っ黒になるのを防ぐ）
-            let validAnchor = predictedAnchor ?? (worldTrackingProvider.state == .running ? worldTrackingProvider.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()) : nil)
+            // 未来予測時刻のアンカーが取れなかった場合は、現在時刻のアンカーでフォールバック
+            var validAnchor = predictedAnchor ?? (worldTrackingProvider.state == .running ? worldTrackingProvider.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()) : nil)
+            
+            // それでも取れなかった場合は、前回の有効なアンカーを使用して画面が暗転するのを防ぐ
+            if validAnchor == nil {
+                validAnchor = lastValidAnchor
+            } else {
+                lastValidAnchor = validAnchor
+            }
             
             if renderFrameCount % 300 == 0 {
                 let hasPB = appModel?.latestPixelBuffer != nil
-                let anchorStatus = validAnchor == nil ? "NIL (World Origin)" : (predictedAnchor != nil ? "VALID (Predicted)" : "VALID (Fallback)")
-                print("[CompositorRenderer] Layer running. renderFrame=\(renderFrameCount) hasPixelBuffer=\(hasPB) anchor=\(anchorStatus)")
+                let anchorStatus = validAnchor == nil ? "NIL (World Origin)" : (predictedAnchor != nil ? "VALID (Predicted)" : "VALID (Fallback/Cached)")
+                let lag = CACurrentMediaTime() - effectiveTs
+                print("[CompositorRenderer] renderFrame=\(renderFrameCount) hasPixelBuffer=\(hasPB) anchor=\(anchorStatus) lag=\(lag*1000)ms ts=\(ts)")
             }
             
             guard let drawable = frame.queryDrawable() else { continue }

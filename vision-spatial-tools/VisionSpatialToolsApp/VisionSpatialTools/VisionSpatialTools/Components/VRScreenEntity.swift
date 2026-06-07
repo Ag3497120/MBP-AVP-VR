@@ -39,7 +39,7 @@ class VRScreenEntity: Entity, HasModel {
         self.position = [0, 0, 0]
         
         // コンポジターからのデコード完了コールバック
-        self.compositor?.onFrameDecoded = { [weak self] pixelBuffer in
+        self.compositor?.onFrameDecoded = { [weak self] pixelBuffer, timestamp in
             self?.updateTexture(with: pixelBuffer)
         }
         

@@ -3,7 +3,7 @@ import VideoToolbox
 import CoreMedia
 
 protocol HEVCVideoDecoderDelegate: AnyObject {
-    func didDecodeFrame(_ pixelBuffer: CVPixelBuffer)
+    func didDecodeFrame(_ pixelBuffer: CVPixelBuffer, timestamp: Double)
 }
 
 class HEVCVideoDecoder {
@@ -18,9 +18,12 @@ class HEVCVideoDecoder {
     private var pps: Data?
     
     private var isH264 = false
+    var decodeTimestampQueue = [UInt32: Double]()
     
     // Parses Annex B stream (0x00 0x00 0x00 0x01) and feeds it to VideoToolbox
-    func decodeAnnexBFrame(_ frameData: Data) {
+    func decodeAnnexBFrame(_ frameData: Data, sequence: UInt32, timestamp: Double) {
+        self.decodeTimestampQueue[sequence] = timestamp
+        
         let nals = extractNALUnits(from: frameData)
         var vclNals = [Data]()
         
@@ -32,16 +35,39 @@ class HEVCVideoDecoder {
             // Check H264
             let h264NalType = nal[0] & 0x1F
             
-            if hevcNalType == 32 { vps = nal; isH264 = false }
-            else if hevcNalType == 33 { sps = nal; isH264 = false }
-            else if hevcNalType == 34 { pps = nal; isH264 = false }
-            else if vps == nil && h264NalType == 7 { sps = nal; isH264 = true }
-            else if vps == nil && h264NalType == 8 { pps = nal; isH264 = true }
+            if hevcNalType == 32 { 
+                if vps != nal { vps = nal; formatDescription = nil }
+                isH264 = false 
+            }
+            else if hevcNalType == 33 { 
+                if sps != nal { sps = nal; formatDescription = nil }
+                isH264 = false 
+            }
+            else if hevcNalType == 34 { 
+                if pps != nal { pps = nal; formatDescription = nil }
+                isH264 = false 
+            }
+            else if vps == nil && h264NalType == 7 { 
+                if sps != nal { sps = nal; formatDescription = nil }
+                isH264 = true 
+            }
+            else if vps == nil && h264NalType == 8 { 
+                if pps != nal { pps = nal; formatDescription = nil }
+                isH264 = true 
+            }
             else { vclNals.append(nal) }
+        }
+        
+        if isH264, formatDescription == nil {
+            print("[HEVCDecoder] Found H264 NALs. SPS: \(sps != nil), PPS: \(pps != nil)")
         }
         
         // Try to create format description
         if formatDescription == nil {
+            if let session = decompressionSession {
+                VTDecompressionSessionInvalidate(session)
+                decompressionSession = nil
+            }
             if isH264, let sps = sps, let pps = pps {
                 createH264FormatDescription(sps: sps, pps: pps)
             } else if !isH264, let vps = vps, let sps = sps, let pps = pps {
@@ -59,7 +85,7 @@ class HEVCVideoDecoder {
             avccData.append(nal)
         }
         
-        decodeAVCCData(avccData)
+        decodeAVCCData(avccData, sequence: sequence)
     }
     
     private func extractNALUnits(from data: Data) -> [Data] {
@@ -100,6 +126,8 @@ class HEVCVideoDecoder {
                     nalUnitHeaderLength: 4,
                     formatDescriptionOut: &newFormatDesc
                 )
+                
+                print("[HEVCDecoder] CMVideoFormatDescriptionCreateFromH264ParameterSets returned \(status)")
                 
                 if status == noErr {
                     self.formatDescription = newFormatDesc
@@ -168,7 +196,8 @@ class HEVCVideoDecoder {
             decompressionSessionOut: &session
         )
         
-        if status == noErr {
+        if status == noErr, let session = session {
+            VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
             self.decompressionSession = session
             print("[HEVCDecoder] Hardware Decompression Session Created!")
         } else {
@@ -176,7 +205,7 @@ class HEVCVideoDecoder {
         }
     }
     
-    private func decodeAVCCData(_ data: Data) {
+    private func decodeAVCCData(_ data: Data, sequence: UInt32) {
         guard let session = decompressionSession else { return }
         
         var blockBuffer: CMBlockBuffer?
@@ -226,11 +255,15 @@ class HEVCVideoDecoder {
         guard let sb = sampleBuffer else { return }
         
         var flagsOut = VTDecodeInfoFlags()
+        
+        var refConSeq = sequence
+        let ptrSeq = UnsafeMutableRawPointer(bitPattern: UInt(refConSeq))
+        
         VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sb,
             flags: [._EnableAsynchronousDecompression],
-            frameRefcon: nil,
+            frameRefcon: ptrSeq,
             infoFlagsOut: &flagsOut
         )
     }
@@ -246,7 +279,15 @@ func decompressionSessionCallback(
     presentationTimeStamp: CMTime,
     presentationDuration: CMTime
 ) {
-    guard status == noErr, let pixelBuffer = imageBuffer else { return }
+    guard status == noErr, let pixelBuffer = imageBuffer else {
+        print("[HEVCDecoder] Decode failed! status: \(status)")
+        return
+    }
     let decoder = Unmanaged<HEVCVideoDecoder>.fromOpaque(decompressionOutputRefCon!).takeUnretainedValue()
-    decoder.delegate?.didDecodeFrame(pixelBuffer)
+    
+    let seq = UInt32(UInt(bitPattern: sourceFrameRefCon))
+    let ts = decoder.decodeTimestampQueue[seq] ?? 0.0
+    decoder.decodeTimestampQueue.removeValue(forKey: seq)
+    
+    decoder.delegate?.didDecodeFrame(pixelBuffer, timestamp: ts)
 }

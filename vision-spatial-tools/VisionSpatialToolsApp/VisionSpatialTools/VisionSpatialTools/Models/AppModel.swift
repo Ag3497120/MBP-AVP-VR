@@ -46,18 +46,34 @@ class AppModel: ObservableObject {
     // Metal レンダーループ（バックグラウンドスレッド）と
     // ネットワークコールバックの両方から安全にアクセスできる
     nonisolated(unsafe) private let _pixelBufferLock = NSLock()
-    nonisolated(unsafe) private var _latestPixelBuffer: CVPixelBuffer? = nil
+    nonisolated(unsafe) private var _presentationQueue: [CVPixelBuffer] = []
+    nonisolated(unsafe) private var _lastPoppedPixelBuffer: CVPixelBuffer? = nil
+    nonisolated(unsafe) private var _latestTimestamp: Double = 0.0
     
-    nonisolated func setLatestPixelBuffer(_ pb: CVPixelBuffer) {
+    nonisolated func setLatestPixelBuffer(_ pb: CVPixelBuffer, timestamp: Double) {
         _pixelBufferLock.lock()
-        _latestPixelBuffer = pb
+        _presentationQueue.append(pb)
+        _latestTimestamp = timestamp
+        // Keep latency low by dropping older frames if the queue grows too large (e.g. > 3 frames)
+        if _presentationQueue.count > 3 {
+            _presentationQueue.removeFirst(_presentationQueue.count - 3)
+        }
         _pixelBufferLock.unlock()
     }
     
     nonisolated var latestPixelBuffer: CVPixelBuffer? {
         _pixelBufferLock.lock()
         defer { _pixelBufferLock.unlock() }
-        return _latestPixelBuffer
+        if !_presentationQueue.isEmpty {
+            _lastPoppedPixelBuffer = _presentationQueue.removeFirst()
+        }
+        return _lastPoppedPixelBuffer
+    }
+    
+    nonisolated var latestTimestamp: Double {
+        _pixelBufferLock.lock()
+        defer { _pixelBufferLock.unlock() }
+        return _latestTimestamp
     }
 
     // vx-browser 移植版 ViewModel
@@ -93,9 +109,9 @@ class AppModel: ObservableObject {
         // デコードされたフレームを AppModel の共有バッファに保存する
         // CompositorRenderer はこのバッファを直接参照するため、
         // インスタンスが複数存在しても必ず最新フレームが使われる
-        self.compositor.onFrameDecoded = { [weak self] pixelBuffer in
+        self.compositor.onFrameDecoded = { [weak self] pixelBuffer, timestamp in
             guard let self = self else { return }
-            self.setLatestPixelBuffer(pixelBuffer)
+            self.setLatestPixelBuffer(pixelBuffer, timestamp: timestamp)
             DispatchQueue.main.async {
                 self.framesReceived += 1
             }
@@ -147,6 +163,9 @@ class AppModel: ObservableObject {
             if HandTrackingProvider.isSupported { providers.append(handTrackingProvider) }
             
             if !providers.isEmpty {
+                // Request authorization before running the session
+                _ = try await arkitSession.requestAuthorization(for: [.handTracking])
+                
                 try await arkitSession.run(providers)
                 print("ARKit tracking started successfully")
             } else {
@@ -178,7 +197,7 @@ class AppModel: ObservableObject {
     private func processGamepadInput() async {
         while true {
             do {
-                try await Task.sleep(nanoseconds: 16_000_000) // ~60fps
+                try await Task.sleep(nanoseconds: 11_111_111) // ~90fps
                 
                 guard let controller = GCController.controllers().first,
                       let pad = controller.extendedGamepad else {
@@ -230,42 +249,132 @@ class AppModel: ObservableObject {
     
     private func processTrackingForVR() async {
         while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 16_000_000) // ~60fps
+            try? await Task.sleep(nanoseconds: 11_111_111) // ~90fps
             
-            // Connection is automatically managed by VisionClientCompositor via Bonjour AWDL
-            let deviceAnchor = worldTrackingProvider.state == .running ? worldTrackingProvider.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()) : nil
+            // Predict ~45ms into the future to account for network, render, encode, and decode latency.
+            // This allows the PC to render the frame for where the head WILL be, eliminating black pull-in on fast head turns.
+            let targetTs = CACurrentMediaTime() + 0.045
+            let deviceAnchor = worldTrackingProvider.state == .running ? worldTrackingProvider.queryDeviceAnchor(atTimestamp: targetTs) : nil
             let headT = deviceAnchor?.originFromAnchorTransform ?? matrix_identity_float4x4
-            var leftT = matrix_identity_float4x4
-            var rightT = matrix_identity_float4x4
+            // If hands are not tracked, put them far below the player (Y = -2.0) so they don't block the camera!
+            var hiddenT = matrix_identity_float4x4
+            hiddenT.columns.3.y = -2.0
+            
+            var leftT = hiddenT
+            var rightT = hiddenT
             
             let hands = handTrackingProvider.state == .running ? handTrackingProvider.latestAnchors : (leftHand: nil, rightHand: nil)
-            if let left = hands.leftHand, left.isTracked {
-                leftT = left.originFromAnchorTransform
-            }
-            if let right = hands.rightHand, right.isTracked {
-                rightT = right.originFromAnchorTransform
+            
+            func getPalmTransform(hand: HandAnchor?) -> simd_float4x4? {
+                guard let hand = hand, hand.isTracked else { return nil }
+                
+                if let skeleton = hand.handSkeleton {
+                    let knuckle = skeleton.joint(.middleFingerKnuckle)
+                    if knuckle.isTracked {
+                        return matrix_multiply(hand.originFromAnchorTransform, knuckle.anchorFromJointTransform)
+                    }
+                }
+                
+                // Fallback to wrist if knuckle isn't tracked (e.g. holding Joy-Con)
+                return hand.originFromAnchorTransform
             }
             
-            func isPinching(hand: HandAnchor?) -> Bool {
-                guard let hand = hand, hand.isTracked, let skeleton = hand.handSkeleton else { return false }
+            if let palmT = getPalmTransform(hand: hands.leftHand) {
+                leftT = palmT
+            }
+            if let palmT = getPalmTransform(hand: hands.rightHand) {
+                rightT = palmT
+            }
+            
+            func getHandInputs(hand: HandAnchor?, isRight: Bool) -> (buttons: UInt32, stickX: Float, stickY: Float) {
+                guard let hand = hand, hand.isTracked, let skeleton = hand.handSkeleton else {
+                    return (0, 0, 0)
+                }
+                
+                var buttons: UInt32 = 0
+                
                 let thumb = skeleton.joint(.thumbTip)
                 let index = skeleton.joint(.indexFingerTip)
-                guard thumb.isTracked && index.isTracked else { return false }
+                let middle = skeleton.joint(.middleFingerTip)
+                let ring = skeleton.joint(.ringFingerTip)
+                let pinky = skeleton.joint(.littleFingerTip)
+                let wrist = skeleton.joint(.wrist)
+                
+                guard thumb.isTracked && index.isTracked && middle.isTracked && ring.isTracked && pinky.isTracked && wrist.isTracked else {
+                    return (0, 0, 0)
+                }
+                
                 let thumbPos = thumb.anchorFromJointTransform.columns.3
                 let indexPos = index.anchorFromJointTransform.columns.3
-                let distance = simd_distance(
-                    simd_make_float3(thumbPos.x, thumbPos.y, thumbPos.z),
-                    simd_make_float3(indexPos.x, indexPos.y, indexPos.z)
-                )
-                return distance < 0.025 // 2.5cm threshold
+                let middlePos = middle.anchorFromJointTransform.columns.3
+                let ringPos = ring.anchorFromJointTransform.columns.3
+                let pinkyPos = pinky.anchorFromJointTransform.columns.3
+                let wristPos = wrist.anchorFromJointTransform.columns.3
+                
+                func dist(_ a: simd_float4, _ b: simd_float4) -> Float {
+                    return simd_distance(simd_make_float3(a.x, a.y, a.z), simd_make_float3(b.x, b.y, b.z))
+                }
+                
+                // 1. Trigger: Thumb to Index
+                if dist(thumbPos, indexPos) < 0.025 {
+                    buttons |= isRight ? (1 << 2) : (1 << 4) // ZR / ZL
+                }
+                
+                // 2. Grip: Middle, Ring, Pinky curled (close to wrist)
+                if dist(middlePos, wristPos) < 0.08 && dist(ringPos, wristPos) < 0.08 {
+                    buttons |= isRight ? (1 << 5) : (1 << 7) // R / L
+                }
+                
+                // 3. A Button / D-Pad Right: Thumb to Ring
+                if dist(thumbPos, ringPos) < 0.025 {
+                    buttons |= (1 << 0)
+                }
+                
+                // 4. B Button / D-Pad Down: Thumb to Pinky
+                if dist(thumbPos, pinkyPos) < 0.025 {
+                    buttons |= (1 << 1)
+                }
+                
+                // 5. Joystick Mode: Thumb to Middle
+                var stickX: Float = 0.0
+                var stickY: Float = 0.0
+                if dist(thumbPos, middlePos) < 0.03 {
+                    let matrix = hand.originFromAnchorTransform
+                    let upVector = matrix.columns.1
+                    
+                    stickY = Float(-upVector.z * 2.0)
+                    stickX = Float(upVector.x * 2.0)
+                    
+                    stickX = max(-1.0, min(1.0, stickX))
+                    stickY = max(-1.0, min(1.0, stickY))
+                }
+                
+                return (buttons, stickX, stickY)
             }
+            
+            let leftInputs = getHandInputs(hand: hands.leftHand, isRight: false)
+            let rightInputs = getHandInputs(hand: hands.rightHand, isRight: true)
+            
+            let leftGrip = (leftInputs.buttons & (1 << 7)) != 0
+            let rightGrip = (rightInputs.buttons & (1 << 5)) != 0
             
             compositor.sendPose(
                 head: headT,
                 leftHand: leftT,
                 rightHand: rightT,
-                leftPinch: isPinching(hand: hands.leftHand) || gamepadPinch,
-                rightPinch: isPinching(hand: hands.rightHand) || gamepadPinch
+                leftPinch: leftGrip,
+                rightPinch: rightGrip
+            )
+            
+            compositor.sendJoycon(
+                rightButtons: rightInputs.buttons,
+                leftButtons: leftInputs.buttons,
+                rightStickX: rightInputs.stickX,
+                rightStickY: rightInputs.stickY,
+                leftStickX: leftInputs.stickX,
+                leftStickY: leftInputs.stickY,
+                rightVelX: 0, rightVelY: 0, rightVelZ: 0,
+                leftVelX: 0, leftVelY: 0, leftVelZ: 0
             )
             
             DispatchQueue.main.async { [weak self] in

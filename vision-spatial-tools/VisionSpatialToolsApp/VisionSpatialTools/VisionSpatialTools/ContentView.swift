@@ -91,7 +91,8 @@ struct ContentView: View {
                     set: { newValue in
                         Task {
                             if newValue {
-                                await openImmersiveSpace(id: "PassthroughStandbySpace")
+                                dismissWindow(id: "mainWindow")
+                                await openImmersiveSpace(id: "SteamVRFullSpace")
                                 await appModel.startTracking()
                             } else {
                                 await dismissImmersiveSpace()

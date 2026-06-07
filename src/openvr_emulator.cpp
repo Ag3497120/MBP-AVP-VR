@@ -1,3 +1,4 @@
+#include <chrono>
 
 #include <windows.h>
 #include <stdio.h>
@@ -5,12 +6,7 @@
 #include <string.h>
 
 void LogMsg(const char* msg) {
-    HANDLE hFile = CreateFileA("vr_emulator_log.txt", FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        DWORD written;
-        WriteFile(hFile, msg, strlen(msg), &written, nullptr);
-        CloseHandle(hFile);
-    }
+    // Disabled to prevent 58GB log file
 }
 #include "openvr.h"
 #include <cstring>
@@ -26,10 +22,13 @@ struct SharedFrame {
     uint32_t width;
     uint32_t height;
     uint32_t format;
+    double renderedTimestamp;
 };
 
 #pragma pack(push, 1)
 struct SharedHands {
+    double poseTimestamp;
+    double renderedTimestamp;
     float headTransform[16];
     float leftTransform[16];
     float rightTransform[16];
@@ -59,7 +58,7 @@ float g_handVelocityR[3] = {0,0,0};
 static void InitSharedMemory() {
     if (hMapFile) return;
     
-    const int mapSize = 16 + 4096 * 4096 * 4 + 194;
+    const int mapSize = 16 + 4096 * 4096 * 4 + 1024;
     
     HANDLE hFile = CreateFileA("C:\\vr_shared_frame.dat", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
@@ -70,14 +69,25 @@ static void InitSharedMemory() {
             DWORD written;
             WriteFile(hFile, "", 1, &written, NULL);
         }
-        hMapFile = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, 0, mapSize, NULL);
-        if (hMapFile) {
-            pBuf = MapViewOfFile(hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, mapSize);
+        HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, 0, 0, "Local\\VRSharedFrame");
+        if (hMap) {
+            void* pBuf = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, mapSize);
             if (pBuf) {
                 pHeader = (SharedFrame*)pBuf;
-                pPixelData = (uint8_t*)pBuf + sizeof(SharedFrame);
                 pSharedHands = (SharedHands*)((uint8_t*)pBuf + 16 + 4096 * 4096 * 4);
-                memset(pSharedHands, 0, sizeof(SharedHands));
+                
+                // Initialize with Identity matrices but place head 1.5m above ground to prevent black screen from floor clipping
+                if (pSharedHands->headTransform[0] == 0.0f && pSharedHands->headTransform[5] == 0.0f) {
+                    float identity[16] = {
+                        1, 0, 0, 0,
+                        0, 1, 0, 0,
+                        0, 0, 1, 0,
+                        0, 1.5f, 0, 1  // Y translation = 1.5f
+                    };
+                    memcpy(pSharedHands->headTransform, identity, sizeof(identity));
+                    memcpy(pSharedHands->leftTransform, identity, sizeof(identity));
+                    memcpy(pSharedHands->rightTransform, identity, sizeof(identity));
+                }
             }
         }
     }
@@ -199,7 +209,7 @@ public:
         if(pnWidth) *pnWidth = 1920;
         if(pnHeight) *pnHeight = 1080;
     }
-    virtual vr::HmdMatrix44_t* GetProjectionMatrix(vr::HmdMatrix44_t *pRet, vr::EVREye eEye, float fNearZ, float fFarZ) override {
+    virtual void GetProjectionMatrix(vr::HmdMatrix44_t *pRet, vr::EVREye eEye, float fNearZ, float fFarZ) override {
         LogMsg("Called: IVRSystem::GetProjectionMatrix\n");
         if (pRet) {
             memset(pRet, 0, sizeof(*pRet));
@@ -214,10 +224,10 @@ public:
             pRet->m[3][2] = -1.0f;
             pRet->m[3][3] = 0.0f;
         }
-        return pRet;
+        return;
     }
     virtual void GetProjectionRaw(EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom) override {
-        LogMsg("Called: IVRSystem::GetProjectionRaw\n");
+        // Fallback to 1.0 (90 deg FOV) to prevent Alyx rendering black frames due to FOV limits
         if(pfLeft) *pfLeft = -1.0f; if(pfRight) *pfRight = 1.0f; if(pfTop) *pfTop = -1.0f; if(pfBottom) *pfBottom = 1.0f;
     }
     virtual bool ComputeDistortion(EVREye eEye, float fU, float fV, DistortionCoordinates_t *pDistortionCoordinates) override {
@@ -231,11 +241,17 @@ public:
         }
         return true;
     }
-    virtual vr::HmdMatrix34_t* GetEyeToHeadTransform(HmdMatrix34_t *pRet, EVREye eEye) override {
+    virtual void GetEyeToHeadTransform(HmdMatrix34_t *pRet, EVREye eEye) override {
         LogMsg("Called: IVRSystem::GetEyeToHeadTransform\n");
-        if(pRet) { memset(pRet, 0, sizeof(*pRet)); }
-        if(pRet) { memset(pRet, 0, sizeof(*pRet)); pRet->m[0][0] = 1; pRet->m[1][1] = 1; pRet->m[2][2] = 1; }
-        return pRet;
+        if(pRet) { 
+            memset(pRet, 0, sizeof(*pRet)); 
+            pRet->m[0][0] = 1; 
+            pRet->m[1][1] = 1; 
+            pRet->m[2][2] = 1; 
+            // 6DoF Stereoscopic IPD offset (approx 64mm)
+            pRet->m[0][3] = (eEye == vr::Eye_Left) ? -0.032f : 0.032f;
+        }
+        return;
     }
     virtual bool GetTimeSinceLastVsync(float *pfSecondsSinceLastVsync, uint64_t *pulFrameCounter) override {
         static uint64_t frame = 0; frame++;
@@ -300,19 +316,19 @@ public:
     virtual void ResetSeatedZeroPose() override {
         LogMsg("Called: IVRSystem::ResetSeatedZeroPose\n");
     }
-    virtual vr::HmdMatrix34_t* GetSeatedZeroPoseToStandingAbsoluteTrackingPose(HmdMatrix34_t *pRet) override {
+    virtual void GetSeatedZeroPoseToStandingAbsoluteTrackingPose(HmdMatrix34_t *pRet) override {
         LogMsg("Called: IVRSystem::GetSeatedZeroPoseToStandingAbsoluteTrackingPose\n");
         if(pRet) { memset(pRet, 0, sizeof(*pRet)); }
         if(pRet) { memset(pRet, 0, sizeof(*pRet)); }
         if(pRet) { ((vr::HmdMatrix34_t*)pRet)->m[0][0] = 1; ((vr::HmdMatrix34_t*)pRet)->m[1][1] = 1; ((vr::HmdMatrix34_t*)pRet)->m[2][2] = 1; }
-        return pRet;
+        return;
     }
-    virtual vr::HmdMatrix34_t* GetRawZeroPoseToStandingAbsoluteTrackingPose(HmdMatrix34_t *pRet) override {
+    virtual void GetRawZeroPoseToStandingAbsoluteTrackingPose(HmdMatrix34_t *pRet) override {
         LogMsg("Called: IVRSystem::GetRawZeroPoseToStandingAbsoluteTrackingPose\n");
         if(pRet) { memset(pRet, 0, sizeof(*pRet)); }
         if(pRet) { memset(pRet, 0, sizeof(*pRet)); }
         if(pRet) { ((vr::HmdMatrix34_t*)pRet)->m[0][0] = 1; ((vr::HmdMatrix34_t*)pRet)->m[1][1] = 1; ((vr::HmdMatrix34_t*)pRet)->m[2][2] = 1; }
-        return pRet;
+        return;
     }
     virtual uint32_t GetSortedTrackedDeviceIndicesOfClass(ETrackedDeviceClass eTrackedDeviceClass, VR_ARRAY_COUNT(unTrackedDeviceIndexArrayCount) vr::TrackedDeviceIndex_t *punTrackedDeviceIndexArray, uint32_t unTrackedDeviceIndexArrayCount, vr::TrackedDeviceIndex_t unRelativeToTrackedDeviceIndex = k_unTrackedDeviceIndex_Hmd) override {
         LogMsg("Called: IVRSystem::GetSortedTrackedDeviceIndicesOfClass\n");
@@ -353,6 +369,8 @@ public:
     virtual float GetFloatTrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
         if(pError) *pError = vr::TrackedProp_Success;
         if(prop == vr::Prop_DisplayFrequency_Float) return 90.0f;
+        if(prop == vr::Prop_UserIpdMeters_Float) return 0.065f;
+        if(prop == vr::Prop_UserHeadToEyeDepthMeters_Float) return 0.0f;
         return 0.0f;
     }
     virtual int32_t GetInt32TrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
@@ -370,14 +388,20 @@ public:
         if(pError) *pError = vr::TrackedProp_Success;
         if(prop == vr::Prop_CurrentUniverseId_Uint64) return 1;
         if(prop == vr::Prop_SupportedButtons_Uint64) return 0xFFFFFFFFFFFFFFFFULL;
+        if(prop == vr::Prop_HardwareRevision_Uint64) return 1;
+        if(prop == vr::Prop_FirmwareVersion_Uint64) return 1;
+        if(prop == vr::Prop_FPGAVersion_Uint64) return 1;
+        if(prop == vr::Prop_VRCVersion_Uint64) return 1;
+        if(prop == vr::Prop_RadioVersion_Uint64) return 1;
+        if(prop == vr::Prop_DongleVersion_Uint64) return 1;
         return 0;
     }
-    virtual vr::HmdMatrix34_t* GetMatrix34TrackedDeviceProperty(HmdMatrix34_t *pRet, vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
+    virtual void GetMatrix34TrackedDeviceProperty(HmdMatrix34_t *pRet, vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
         LogMsg("Called: IVRSystem::GetMatrix34TrackedDeviceProperty\n");
         if(pRet) { memset(pRet, 0, sizeof(*pRet)); }
         if(pRet) { memset(pRet, 0, sizeof(*pRet)); pRet->m[0][0] = 1; pRet->m[1][1] = 1; pRet->m[2][2] = 1; }
         if(pError) *pError = vr::TrackedProp_Success;
-        return pRet;
+        return;
     }
     virtual uint32_t GetArrayTrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, PropertyTypeTag_t propType, void *pBuffer, uint32_t unBufferSize, ETrackedPropertyError *pError = 0L) override {
         LogMsg("Called: IVRSystem::GetArrayTrackedDeviceProperty\n");
@@ -431,6 +455,8 @@ public:
             if (lb & (1<<4)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); // ZL
             if (lb & (1<<5)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // L3
             if (lb & (1<<6)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_System); // Minus
+            if (lb & (1<<0)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_A); // A
+            if (lb & (1<<1)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu); // B
 
             if (pSharedHands->rightPinch) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
             if (rb & (1<<2)) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); // ZR
@@ -476,14 +502,14 @@ public:
         LogMsg("Called: IVRSystem::GetEventTypeNameFromEnum\n");
         return "1.10.30";
     }
-    virtual vr::HiddenAreaMesh_t* GetHiddenAreaMesh(HiddenAreaMesh_t *pRet, EVREye eEye, EHiddenAreaMeshType type = k_eHiddenAreaMesh_Standard) override {
+    virtual void GetHiddenAreaMesh(HiddenAreaMesh_t *pRet, EVREye eEye, EHiddenAreaMeshType type = k_eHiddenAreaMesh_Standard) override {
         LogMsg("Called: IVRSystem::GetHiddenAreaMesh\n");
         static vr::HmdVector2_t dummy_verts[3] = { { 2.0f, 2.0f }, { 2.0f, 2.1f }, { 2.1f, 2.0f } };
         if(pRet) { 
             pRet->pVertexData = dummy_verts; 
             pRet->unTriangleCount = 1; 
         }
-        return pRet;
+        return;
     }
     virtual bool GetControllerState(vr::TrackedDeviceIndex_t unControllerDeviceIndex, vr::VRControllerState_t *pControllerState, uint32_t unControllerStateSize) override {
         if(pControllerState) {
@@ -644,8 +670,8 @@ public:
     virtual void* DummyPadding58() { return nullptr; }
     virtual void* DummyPadding59() { return nullptr; }
     virtual void* DummyPadding60() { return nullptr; }
-    virtual void* DummyPadding61() { return nullptr; }
-    virtual void* DummyPadding62() { return nullptr; }
+    virtual void* Dummy61() { return nullptr; }
+    virtual void* Dummy62() { return nullptr; }
     virtual void* DummyPadding63() { return nullptr; }
     virtual void* DummyPadding64() { return nullptr; }
     virtual void* DummyPadding65() { return nullptr; }
@@ -1023,36 +1049,36 @@ public:
     virtual void* DummyPadding67() { return nullptr; }
     virtual void* DummyPadding68() { return nullptr; }
     virtual void* DummyPadding69() { return nullptr; }
-    virtual void* DummyPadding70() { return nullptr; }
-    virtual void* DummyPadding71() { return nullptr; }
-    virtual void* DummyPadding72() { return nullptr; }
-    virtual void* DummyPadding73() { return nullptr; }
-    virtual void* DummyPadding74() { return nullptr; }
-    virtual void* DummyPadding75() { return nullptr; }
-    virtual void* DummyPadding76() { return nullptr; }
-    virtual void* DummyPadding77() { return nullptr; }
-    virtual void* DummyPadding78() { return nullptr; }
-    virtual void* DummyPadding79() { return nullptr; }
-    virtual void* DummyPadding80() { return nullptr; }
-    virtual void* DummyPadding81() { return nullptr; }
-    virtual void* DummyPadding82() { return nullptr; }
-    virtual void* DummyPadding83() { return nullptr; }
-    virtual void* DummyPadding84() { return nullptr; }
-    virtual void* DummyPadding85() { return nullptr; }
-    virtual void* DummyPadding86() { return nullptr; }
-    virtual void* DummyPadding87() { return nullptr; }
-    virtual void* DummyPadding88() { return nullptr; }
-    virtual void* DummyPadding89() { return nullptr; }
-    virtual void* DummyPadding90() { return nullptr; }
-    virtual void* DummyPadding91() { return nullptr; }
-    virtual void* DummyPadding92() { return nullptr; }
-    virtual void* DummyPadding93() { return nullptr; }
-    virtual void* DummyPadding94() { return nullptr; }
-    virtual void* DummyPadding95() { return nullptr; }
-    virtual void* DummyPadding96() { return nullptr; }
-    virtual void* DummyPadding97() { return nullptr; }
-    virtual void* DummyPadding98() { return nullptr; }
-    virtual void* DummyPadding99() { return nullptr; }
+    virtual void* Dummy70() { return nullptr; }
+    virtual void* Dummy71() { return nullptr; }
+    virtual void* Dummy72() { return nullptr; }
+    virtual void* Dummy73() { return nullptr; }
+    virtual void* Dummy74() { return nullptr; }
+    virtual void* Dummy75() { return nullptr; }
+    virtual void* Dummy76() { return nullptr; }
+    virtual void* Dummy77() { return nullptr; }
+    virtual void* Dummy78() { return nullptr; }
+    virtual void* Dummy79() { return nullptr; }
+    virtual void* Dummy80() { return nullptr; }
+    virtual void* Dummy81() { return nullptr; }
+    virtual void* Dummy82() { return nullptr; }
+    virtual void* Dummy83() { return nullptr; }
+    virtual void* Dummy84() { return nullptr; }
+    virtual void* Dummy85() { return nullptr; }
+    virtual void* Dummy86() { return nullptr; }
+    virtual void* Dummy87() { return nullptr; }
+    virtual void* Dummy88() { return nullptr; }
+    virtual void* Dummy89() { return nullptr; }
+    virtual void* Dummy90() { return nullptr; }
+    virtual void* Dummy91() { return nullptr; }
+    virtual void* Dummy92() { return nullptr; }
+    virtual void* Dummy93() { return nullptr; }
+    virtual void* Dummy94() { return nullptr; }
+    virtual void* Dummy95() { return nullptr; }
+    virtual void* Dummy96() { return nullptr; }
+    virtual void* Dummy97() { return nullptr; }
+    virtual void* Dummy98() { return nullptr; }
+    virtual void* Dummy99() { return nullptr; }
 } g_mockSettings;
 
 class Mock_IVRChaperone : public vr::IVRChaperone {
@@ -1231,12 +1257,12 @@ public:
         return false;
     }
     virtual bool GetWorkingSeatedZeroPoseToRawTrackingPose(HmdMatrix34_t *pmatSeatedZeroPoseToRawTrackingPose) override {
-        LogMsg("Called: IVRChaperoneSetup::GetWorkingSeatedZeroPoseToRawTrackingPose\n");
-        return false;
+        if(pmatSeatedZeroPoseToRawTrackingPose) { memset(pmatSeatedZeroPoseToRawTrackingPose, 0, sizeof(*pmatSeatedZeroPoseToRawTrackingPose)); pmatSeatedZeroPoseToRawTrackingPose->m[0][0] = 1; pmatSeatedZeroPoseToRawTrackingPose->m[1][1] = 1; pmatSeatedZeroPoseToRawTrackingPose->m[2][2] = 1; }
+        return true;
     }
     virtual bool GetWorkingStandingZeroPoseToRawTrackingPose(HmdMatrix34_t *pmatStandingZeroPoseToRawTrackingPose) override {
-        LogMsg("Called: IVRChaperoneSetup::GetWorkingStandingZeroPoseToRawTrackingPose\n");
-        return false;
+        if(pmatStandingZeroPoseToRawTrackingPose) { memset(pmatStandingZeroPoseToRawTrackingPose, 0, sizeof(*pmatStandingZeroPoseToRawTrackingPose)); pmatStandingZeroPoseToRawTrackingPose->m[0][0] = 1; pmatStandingZeroPoseToRawTrackingPose->m[1][1] = 1; pmatStandingZeroPoseToRawTrackingPose->m[2][2] = 1; }
+        return true;
     }
     virtual void SetWorkingPlayAreaSize(float sizeX, float sizeZ) override {
         LogMsg("Called: IVRChaperoneSetup::SetWorkingPlayAreaSize\n");
@@ -1257,8 +1283,8 @@ public:
         LogMsg("Called: IVRChaperoneSetup::ReloadFromDisk\n");
     }
     virtual bool GetLiveSeatedZeroPoseToRawTrackingPose(HmdMatrix34_t *pmatSeatedZeroPoseToRawTrackingPose) override {
-        LogMsg("Called: IVRChaperoneSetup::GetLiveSeatedZeroPoseToRawTrackingPose\n");
-        return false;
+        if(pmatSeatedZeroPoseToRawTrackingPose) { memset(pmatSeatedZeroPoseToRawTrackingPose, 0, sizeof(*pmatSeatedZeroPoseToRawTrackingPose)); pmatSeatedZeroPoseToRawTrackingPose->m[0][0] = 1; pmatSeatedZeroPoseToRawTrackingPose->m[1][1] = 1; pmatSeatedZeroPoseToRawTrackingPose->m[2][2] = 1; }
+        return true;
     }
     virtual bool ExportLiveToBuffer(VR_OUT_STRING() char *pBuffer, uint32_t *pnBufferLength) override {
         LogMsg("Called: IVRChaperoneSetup::ExportLiveToBuffer\n");
@@ -1339,7 +1365,7 @@ public:
     virtual void* DummyPadding59() { return nullptr; }
     virtual void* DummyPadding60() { return nullptr; }
     virtual void* DummyPadding61() { return nullptr; }
-    virtual void* DummyPadding62() { return nullptr; }
+    virtual void* Dummy62() { return nullptr; }
     virtual void* DummyPadding63() { return nullptr; }
     virtual void* DummyPadding64() { return nullptr; }
     virtual void* DummyPadding65() { return nullptr; }
@@ -1347,37 +1373,112 @@ public:
     virtual void* DummyPadding67() { return nullptr; }
     virtual void* DummyPadding68() { return nullptr; }
     virtual void* DummyPadding69() { return nullptr; }
-    virtual void* DummyPadding70() { return nullptr; }
-    virtual void* DummyPadding71() { return nullptr; }
-    virtual void* DummyPadding72() { return nullptr; }
-    virtual void* DummyPadding73() { return nullptr; }
-    virtual void* DummyPadding74() { return nullptr; }
-    virtual void* DummyPadding75() { return nullptr; }
-    virtual void* DummyPadding76() { return nullptr; }
-    virtual void* DummyPadding77() { return nullptr; }
-    virtual void* DummyPadding78() { return nullptr; }
-    virtual void* DummyPadding79() { return nullptr; }
-    virtual void* DummyPadding80() { return nullptr; }
-    virtual void* DummyPadding81() { return nullptr; }
-    virtual void* DummyPadding82() { return nullptr; }
-    virtual void* DummyPadding83() { return nullptr; }
-    virtual void* DummyPadding84() { return nullptr; }
-    virtual void* DummyPadding85() { return nullptr; }
-    virtual void* DummyPadding86() { return nullptr; }
-    virtual void* DummyPadding87() { return nullptr; }
-    virtual void* DummyPadding88() { return nullptr; }
-    virtual void* DummyPadding89() { return nullptr; }
-    virtual void* DummyPadding90() { return nullptr; }
-    virtual void* DummyPadding91() { return nullptr; }
-    virtual void* DummyPadding92() { return nullptr; }
-    virtual void* DummyPadding93() { return nullptr; }
-    virtual void* DummyPadding94() { return nullptr; }
-    virtual void* DummyPadding95() { return nullptr; }
-    virtual void* DummyPadding96() { return nullptr; }
-    virtual void* DummyPadding97() { return nullptr; }
-    virtual void* DummyPadding98() { return nullptr; }
-    virtual void* DummyPadding99() { return nullptr; }
+    virtual void* Dummy70() { return nullptr; }
+    virtual void* Dummy71() { return nullptr; }
+    virtual void* Dummy72() { return nullptr; }
+    virtual void* Dummy73() { return nullptr; }
+    virtual void* Dummy74() { return nullptr; }
+    virtual void* Dummy75() { return nullptr; }
+    virtual void* Dummy76() { return nullptr; }
+    virtual void* Dummy77() { return nullptr; }
+    virtual void* Dummy78() { return nullptr; }
+    virtual void* Dummy79() { return nullptr; }
+    virtual void* Dummy80() { return nullptr; }
+    virtual void* Dummy81() { return nullptr; }
+    virtual void* Dummy82() { return nullptr; }
+    virtual void* Dummy83() { return nullptr; }
+    virtual void* Dummy84() { return nullptr; }
+    virtual void* Dummy85() { return nullptr; }
+    virtual void* Dummy86() { return nullptr; }
+    virtual void* Dummy87() { return nullptr; }
+    virtual void* Dummy88() { return nullptr; }
+    virtual void* Dummy89() { return nullptr; }
+    virtual void* Dummy90() { return nullptr; }
+    virtual void* Dummy91() { return nullptr; }
+    virtual void* Dummy92() { return nullptr; }
+    virtual void* Dummy93() { return nullptr; }
+    virtual void* Dummy94() { return nullptr; }
+    virtual void* Dummy95() { return nullptr; }
+    virtual void* Dummy96() { return nullptr; }
+    virtual void* Dummy97() { return nullptr; }
+    virtual void* Dummy98() { return nullptr; }
+    virtual void* Dummy99() { return nullptr; }
 } g_mockChaperoneSetup;
+
+inline uint8_t Cvt11F(uint32_t val) {
+    uint32_t mantissa = val & 0x3F;
+    uint32_t exponent = (val >> 6) & 0x1F;
+    if (exponent == 0) return 0;
+    if (exponent == 31) return 255;
+    int exp_adj = (int)exponent - 15;
+    if (exp_adj > 0) return 255;
+    if (exp_adj < -8) return 0;
+    uint32_t v = (64 + mantissa) * 255;
+    if (exp_adj < 0) v >>= (-exp_adj);
+    return (v / 64) > 255 ? 255 : (uint8_t)(v / 64);
+}
+
+inline uint8_t Cvt10F(uint32_t val) {
+    uint32_t mantissa = val & 0x1F;
+    uint32_t exponent = (val >> 5) & 0x1F;
+    if (exponent == 0) return 0;
+    if (exponent == 31) return 255;
+    int exp_adj = (int)exponent - 15;
+    if (exp_adj > 0) return 255;
+    if (exp_adj < -8) return 0;
+    uint32_t v = (32 + mantissa) * 255;
+    if (exp_adj < 0) v >>= (-exp_adj);
+    return (v / 32) > 255 ? 255 : (uint8_t)(v / 32);
+}
+
+void CopyAndConvertFormat(uint8_t* dstRow, const uint8_t* srcRow, uint32_t width, DXGI_FORMAT format) {
+    if (format == DXGI_FORMAT_R11G11B10_FLOAT) {
+        uint32_t* dst32 = (uint32_t*)dstRow;
+        const uint32_t* src32 = (const uint32_t*)srcRow;
+        for (uint32_t x = 0; x < width; ++x) {
+            uint32_t p = src32[x];
+            uint32_t r = p & 0x7FF;
+            uint32_t g = (p >> 11) & 0x7FF;
+            uint32_t b = (p >> 22) & 0x3FF;
+            dst32[x] = (255 << 24) | (Cvt11F(r) << 16) | (Cvt11F(g) << 8) | Cvt10F(b);
+        }
+    } else if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        uint32_t* dst32 = (uint32_t*)dstRow;
+        const uint16_t* src16 = (const uint16_t*)srcRow;
+        for (uint32_t x = 0; x < width; ++x) {
+            uint16_t r = src16[x*4];
+            uint16_t g = src16[x*4+1];
+            uint16_t b = src16[x*4+2];
+            
+            auto Cvt16F = [](uint16_t val) -> uint8_t {
+                uint32_t mantissa = val & 0x3FF;
+                uint32_t exponent = (val >> 10) & 0x1F;
+                if (exponent == 0) return 0;
+                if (exponent == 31) return 255;
+                int exp_adj = (int)exponent - 15;
+                if (exp_adj > 0) return 255;
+                if (exp_adj < -8) return 0;
+                uint32_t v = (1024 + mantissa) * 255;
+                if (exp_adj < 0) v >>= (-exp_adj);
+                return (v / 1024) > 255 ? 255 : (uint8_t)(v / 1024);
+            };
+            
+            dst32[x] = (255 << 24) | (Cvt16F(r) << 16) | (Cvt16F(g) << 8) | Cvt16F(b);
+        }
+    } else if (format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+        uint32_t* dst32 = (uint32_t*)dstRow;
+        const uint8_t* src8 = srcRow;
+        for (uint32_t x = 0; x < width; ++x) {
+            uint8_t r = src8[x*4];
+            uint8_t g = src8[x*4+1];
+            uint8_t b = src8[x*4+2];
+            uint8_t a = src8[x*4+3];
+            dst32[x] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    } else {
+        memcpy(dstRow, srcRow, width * 4);
+    }
+}
 
 class Mock_IVRCompositor : public vr::IVRCompositor {
 public:
@@ -1388,8 +1489,13 @@ public:
         LogMsg("Called: IVRCompositor::GetTrackingSpace\n");
         return (ETrackingUniverseOrigin)0;
     }
+    double g_LastWaitTimestamp = 0.0;
+    
     virtual EVRCompositorError WaitGetPoses(VR_ARRAY_COUNT( unRenderPoseArrayCount ) TrackedDevicePose_t* pRenderPoseArray, uint32_t unRenderPoseArrayCount, VR_ARRAY_COUNT( unGamePoseArrayCount ) TrackedDevicePose_t* pGamePoseArray, uint32_t unGamePoseArrayCount) override {
         LogMsg("Called: IVRCompositor::WaitGetPoses\n");
+        if (pSharedHands) {
+            g_LastWaitTimestamp = pSharedHands->poseTimestamp;
+        }
         if(pRenderPoseArray && unRenderPoseArrayCount > 0) {
             memset(pRenderPoseArray, 0, sizeof(vr::TrackedDevicePose_t) * unRenderPoseArrayCount);
             for(uint32_t i=0; i<3 && i<unRenderPoseArrayCount; ++i) {
@@ -1420,6 +1526,7 @@ public:
                         pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1.0f;
                         pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1.0f;
                         pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1.0f;
+                        pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.5f; // Place head 1.5m above ground
                     }
                 }
             }
@@ -1451,12 +1558,12 @@ public:
                         pGamePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1.0f;
                         pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1.0f;
                         pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1.0f;
+                        pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.5f; // Place head 1.5m above ground
                     }
                 }
             }
         }
         
-// Removed local velocity declaration
         static float lastLeft[3] = {0,0,0};
         static float lastRight[3] = {0,0,0};
         static DWORD lastTime = GetTickCount();
@@ -1466,7 +1573,6 @@ public:
         if (dt > 0.1f) dt = 0.1f;
         
         if (pSharedHands) {
-            float curLeft[3] = { pSharedHands->leftTransform[3], pSharedHands->leftTransform[7], pSharedHands->leftTransform[11] }; // Wait, translation is at indices 3, 7, 11 (if row-major) or 12, 13, 14 (if col-major)! In my previous code, I assigned m[r][c] = leftTransform[c*4+r]. That means 12,13,14 are translation!
             float cL[3] = { pSharedHands->leftTransform[12], pSharedHands->leftTransform[13], pSharedHands->leftTransform[14] };
             float cR[3] = { pSharedHands->rightTransform[12], pSharedHands->rightTransform[13], pSharedHands->rightTransform[14] };
             
@@ -1491,7 +1597,15 @@ public:
         }
         lastTime = now;
         
-        Sleep(11);
+        static auto lastFrameStart = std::chrono::high_resolution_clock::now();
+        auto currentFrameEnd = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentFrameEnd - lastFrameStart).count();
+        long targetFrameTime = 11; // ~90fps
+        if (elapsed < targetFrameTime) {
+            Sleep(targetFrameTime - elapsed);
+        }
+        lastFrameStart = std::chrono::high_resolution_clock::now();
+        
         return vr::VRCompositorError_None;
     }
     virtual EVRCompositorError GetLastPoses(VR_ARRAY_COUNT( unRenderPoseArrayCount ) TrackedDevicePose_t* pRenderPoseArray, uint32_t unRenderPoseArrayCount, VR_ARRAY_COUNT( unGamePoseArrayCount ) TrackedDevicePose_t* pGamePoseArray, uint32_t unGamePoseArrayCount) override {
@@ -1503,6 +1617,14 @@ public:
         return (EVRCompositorError)1;
     }
     virtual EVRCompositorError Submit(vr::EVREye eEye, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t* pBounds, vr::EVRSubmitFlags nSubmitFlags) override {
+        if(eEye == vr::Eye_Right) {
+            if (pSharedHands) {
+                //pSharedHands->sequenceNumber++;
+            }
+            if (pSharedHands) {
+                pSharedHands->renderedTimestamp = g_LastWaitTimestamp;
+            }
+        }
         if(pTexture && pTexture->handle && pTexture->eType == vr::TextureType_DirectX) {
             ID3D11Texture2D* pGameTex = (ID3D11Texture2D*)pTexture->handle;
             D3D11_TEXTURE2D_DESC desc;
@@ -1566,22 +1688,30 @@ public:
                                         pHeader->width = srcWidth * 2;
                                         pHeader->height = srcHeight;
                                         pHeader->format = desc.Format;
+                                        pHeader->renderedTimestamp = pSharedHands ? pSharedHands->poseTimestamp : 0.0;
                                     }
                                     
                                     uint32_t copyWidth = (srcWidth > 4096) ? 4096 : srcWidth;
                                     uint32_t copyHeight = (srcHeight > 4096) ? 4096 : srcHeight;
                                     
+                                    uint32_t srcBpp = 4;
+                                    if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) srcBpp = 8;
+                                    
                                     uint8_t* dst = pPixelData;
-                                    uint8_t* src = ((uint8_t*)mapped.pData) + srcY * mapped.RowPitch + srcX * 4;
+                                    uint8_t* src = ((uint8_t*)mapped.pData) + srcY * mapped.RowPitch + srcX * srcBpp;
+                                    
+                                    if (pHeader) {
+                                        pHeader->format = DXGI_FORMAT_B8G8R8A8_UNORM; // Force to 32BGRA
+                                    }
                                     
                                     if (eEye == vr::Eye_Left) {
                                         for(uint32_t y=0; y<copyHeight; ++y) {
-                                            memcpy(dst + y * (copyWidth * 2) * 4, src + y * mapped.RowPitch, copyWidth * 4);
+                                            CopyAndConvertFormat(dst + y * (copyWidth * 2) * 4, src + y * mapped.RowPitch, copyWidth, desc.Format);
                                         }
                                     } else {
                                         // Right eye mapped next to it
                                         for(uint32_t y=0; y<copyHeight; ++y) {
-                                            memcpy(dst + y * (copyWidth * 2) * 4 + copyWidth * 4, src + y * mapped.RowPitch, copyWidth * 4);
+                                            CopyAndConvertFormat(dst + y * (copyWidth * 2) * 4 + copyWidth * 4, src + y * mapped.RowPitch, copyWidth, desc.Format);
                                         }
                                     }
                                     
@@ -1624,11 +1754,11 @@ public:
     virtual void FadeToColor(float fSeconds, float fRed, float fGreen, float fBlue, float fAlpha, bool bBackground = false) override {
         LogMsg("Called: IVRCompositor::FadeToColor\n");
     }
-    virtual vr::HmdColor_t* GetCurrentFadeColor(HmdColor_t *pRet, bool bBackground = false) override {
+    virtual void GetCurrentFadeColor(HmdColor_t *pRet, bool bBackground = false) override {
         LogMsg("Called: IVRCompositor::GetCurrentFadeColor\n");
         if(pRet) { memset(pRet, 0, sizeof(*pRet)); }
         if(pRet) { memset(pRet, 0, sizeof(*pRet)); }
-        return pRet;
+        return;
     }
     virtual void FadeGrid(float fSeconds, bool bFadeIn) override {
         LogMsg("Called: IVRCompositor::FadeGrid\n");
@@ -4317,7 +4447,7 @@ extern "C" __declspec(dllexport) uint32_t VR_InitInternal2(vr::EVRInitError *peE
     LogMsg("Called: VR_InitInternal2\n");
 
     // Inject COM VTable hooks to capture rendering context safely
-    ApplyCOMHooks();
+    //ApplyCOMHooks();
 
     InitSharedMemory();
     return 1;
