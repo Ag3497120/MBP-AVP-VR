@@ -239,16 +239,16 @@ public:
     }
 #endif
     virtual void GetWindowBounds(int32_t* pnX, int32_t* pnY, uint32_t* pnWidth, uint32_t* pnHeight) override {
-        *pnX = 0; *pnY = 0; *pnWidth = 1920; *pnHeight = 1080;
+        *pnX = 0; *pnY = 0; *pnWidth = 3840; *pnHeight = 2160;
     }
     virtual bool IsDisplayOnDesktop() override { return false; }
     virtual bool IsDisplayRealDisplay() override { return false; }
     virtual void GetRecommendedRenderTargetSize(uint32_t* pnWidth, uint32_t* pnHeight) override {
-        *pnWidth = 960; *pnHeight = 1080;
+        *pnWidth = 1920; *pnHeight = 2160;
     }
     virtual void GetEyeOutputViewport(vr::EVREye eEye, uint32_t* pnX, uint32_t* pnY, uint32_t* pnWidth, uint32_t* pnHeight) override {
-        *pnY = 0; *pnWidth = 1920 / 2; *pnHeight = 1080;
-        if (eEye == vr::Eye_Left) *pnX = 0; else *pnX = 1920 / 2;
+        *pnY = 0; *pnWidth = 1920; *pnHeight = 2160;
+        if (eEye == vr::Eye_Left) *pnX = 0; else *pnX = 1920;
     }
     virtual void GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, float* pfTop, float* pfBottom) override {
         *pfLeft = -1.0f; *pfRight = 1.0f; *pfTop = -1.0f; *pfBottom = 1.0f;
@@ -279,11 +279,11 @@ public:
         m_unObjectId = unObjectId;
         m_ulPropertyContainer = vr::VRProperties()->TrackedDeviceToPropertyContainer(m_unObjectId);
 
-        vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ModelNumber_String, m_bIsLeft ? "VerantyxController_Left" : "VerantyxController_Right");
-        vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_RenderModelName_String, "vr_controller_vive_1_5");
+        vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ModelNumber_String, m_bIsLeft ? "Oculus Rift S (Left Controller)" : "Oculus Rift S (Right Controller)");
+        vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_RenderModelName_String, m_bIsLeft ? "oculus_rifts_controller_left" : "oculus_rifts_controller_right");
         
         // This is strictly required for SteamVR to process inputs!
-        vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_InputProfilePath_String, "{htc}/input/vive_controller_profile.json");
+        vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_InputProfilePath_String, "{oculus}/input/touch_profile.json");
         
         vr::VRProperties()->SetInt32Property(m_ulPropertyContainer, vr::Prop_ControllerRoleHint_Int32, m_bIsLeft ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand);
         vr::VRProperties()->SetInt32Property(m_ulPropertyContainer, vr::Prop_DeviceClass_Int32, vr::TrackedDeviceClass_Controller);

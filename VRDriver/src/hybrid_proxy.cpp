@@ -162,7 +162,8 @@ class Mock_IVRSystem : public vr::IVRSystem {
 public:
     virtual void GetRecommendedRenderTargetSize(uint32_t *pnWidth, uint32_t *pnHeight) override {
         FILE* f_GetRecommendedRenderTargetSize = fopen("vr_emulator_log.txt", "a"); if(f_GetRecommendedRenderTargetSize) { fprintf(f_GetRecommendedRenderTargetSize, "Called: IVRSystem::GetRecommendedRenderTargetSize\n"); fclose(f_GetRecommendedRenderTargetSize); }
-        return;
+        if(pnWidth) *pnWidth = 1920;
+        if(pnHeight) *pnHeight = 2160;
     }
     virtual HmdMatrix44_t GetProjectionMatrix(EVREye eEye, float fNearZ, float fFarZ) override {
         FILE* f_GetProjectionMatrix = fopen("vr_emulator_log.txt", "a"); if(f_GetProjectionMatrix) { fprintf(f_GetProjectionMatrix, "Called: IVRSystem::GetProjectionMatrix\n"); fclose(f_GetProjectionMatrix); }

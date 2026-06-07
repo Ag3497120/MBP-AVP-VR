@@ -273,9 +273,14 @@ func setupEncoder(width: Int32, height: Int32) {
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse) // Disable B-frames
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
     
-    var bitrate: Int32 = 15_000_000 // Bump to 15 Mbps for higher quality since we use fewer I-frames
+    var bitrate: Int32 = 25_000_000 // Bump to 25 Mbps for ultra-high quality direct AP streaming
     let bitrateNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &bitrate)
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateNum)
+    
+    // Explicitly tell the encoder to pace itself at 90fps for buttery smoothness
+    var expectedFPS: Int32 = 90
+    let expectedFPSNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &expectedFPS)
+    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: expectedFPSNum)
     
     // Force an I-frame every 0.5 seconds (45 frames at 90fps) to ensure immediate recovery from dropped UDP packets!
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 45 as CFNumber)
