@@ -277,8 +277,8 @@ func setupEncoder(width: Int32, height: Int32) {
     let bitrateNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &bitrate)
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateNum)
     
-    // Avoid network spikes by only sending an I-frame once every 10 seconds (900 frames)
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 900 as CFNumber)
+    // Force an I-frame every 0.5 seconds (45 frames at 90fps) to ensure immediate recovery from dropped UDP packets!
+    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 45 as CFNumber)
     
     VTCompressionSessionPrepareToEncodeFrames(compressionSession!)
 }

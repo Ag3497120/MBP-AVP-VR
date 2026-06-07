@@ -183,39 +183,27 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
             print("[VisionClient] SUCCESS: Assembled FULL frame \(seq) with \(totalChunks) chunks!")
             let completeFrame = assembler.frameBuffer.subdata(in: 0..<assembler.maxFrameSize)
             
-            // Queue the frame for sequential decoding
-            readyToDecodeQueue[seq] = completeFrame
-            
             if seq > currentSeq {
                 currentSeq = seq
             }
             
-            // Sequential decode logic
             if lastDecodedSeq == 0 || seq < lastDecodedSeq {
-                // Initialize or reset (e.g. after restart)
                 lastDecodedSeq = seq - 1
             }
             
-            // If the next expected frame is missing for too long (e.g., 30 frames behind currentSeq), skip it!
-            // We MUST wait for keyframes because if we skip a keyframe, all subsequent P-frames will fail with -17694 (ReferenceMissing)
-            if currentSeq > lastDecodedSeq + 30 {
-                lastDecodedSeq = currentSeq - 30
+            // ZERO-DELAY INSTANT DECODE!
+            // If a frame completes, and it's newer than the last decoded frame, decode it immediately.
+            // This ensures that a dropped UDP packet (which ruins one frame) DOES NOT freeze the entire stream!
+            // Combined with a 0.5s MaxKeyFrameInterval, visual glitches recover instantly without stutter.
+            if seq > lastDecodedSeq {
+                decoder.decodeAnnexBFrame(completeFrame, sequence: seq, timestamp: assembler.timestamp)
+                lastDecodedSeq = seq
             }
             
-            // Decode all queued frames in strict sequential order
-            while let frameToDecode = readyToDecodeQueue[lastDecodedSeq + 1] {
-                lastDecodedSeq += 1
-                decoder.decodeAnnexBFrame(frameToDecode, sequence: lastDecodedSeq, timestamp: assembler.timestamp)
-                readyToDecodeQueue.removeValue(forKey: lastDecodedSeq)
-            }
-            
-            // Clean up old assemblers and queued frames
+            // Clean up old assemblers to save memory
             assemblers.removeValue(forKey: seq)
-            let keysToRemove = assemblers.keys.filter { $0 < currentSeq && (currentSeq - $0 > 30) }
+            let keysToRemove = assemblers.keys.filter { $0 < currentSeq && (currentSeq - $0 > 10) }
             for k in keysToRemove { assemblers.removeValue(forKey: k) }
-            
-            let staleFrames = readyToDecodeQueue.keys.filter { $0 < lastDecodedSeq }
-            for k in staleFrames { readyToDecodeQueue.removeValue(forKey: k) }
         }
     }
     
