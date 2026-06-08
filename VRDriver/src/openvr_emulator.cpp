@@ -64,90 +64,110 @@ static float g_lastLeftTransform[16] = {0};
 static float g_lastRightTransform[16] = {0};
 static float g_lastLeftVel[3] = {0,0,0};
 static float g_lastRightVel[3] = {0,0,0};
+static float g_lastLeftAngularVel[3] = {0,0,0};
+static float g_lastRightAngularVel[3] = {0,0,0};
 
-void ApplySmoothPose(vr::TrackedDevicePose_t* pose, float* targetTransform, float* lastTransform, float* lastVel, float fPredictedSecondsToPhotonsFromNow, float dt) {
+void ApplySmoothPose(vr::TrackedDevicePose_t* pose, float* targetTransform, float* lastTransform, float* lastVel, float* lastAngularVel, float fPredictedSecondsToPhotonsFromNow, float dt) {
     if (lastTransform[0] == 0.0f && lastTransform[5] == 0.0f && lastTransform[10] == 0.0f) {
         for(int i=0; i<16; i++) lastTransform[i] = targetTransform[i];
-    }
-    
-    // Lower smoothing factor means heavier smoothing. 15.0 provides a good balance for buttery smooth hands.
-    float smoothFactor = 15.0f * dt;
-    if (smoothFactor > 1.0f) smoothFactor = 1.0f;
-    
-    float smoothed[16];
-    for(int i=0; i<16; i++) {
-        smoothed[i] = lastTransform[i] + (targetTransform[i] - lastTransform[i]) * smoothFactor;
-    }
-    
-    // Gram-Schmidt Orthogonalization (Col 0 and Col 1) to restore rotation matrix validity
-    float v0[3] = {smoothed[0], smoothed[1], smoothed[2]};
-    float len0 = sqrtf(v0[0]*v0[0] + v0[1]*v0[1] + v0[2]*v0[2]);
-    if(len0 > 0.0001f) { v0[0]/=len0; v0[1]/=len0; v0[2]/=len0; }
-    
-    float v1[3] = {smoothed[4], smoothed[5], smoothed[6]};
-    float dot01 = v0[0]*v1[0] + v0[1]*v1[1] + v0[2]*v1[2];
-    v1[0] -= dot01 * v0[0]; v1[1] -= dot01 * v0[1]; v1[2] -= dot01 * v0[2];
-    float len1 = sqrtf(v1[0]*v1[0] + v1[1]*v1[1] + v1[2]*v1[2]);
-    if(len1 > 0.0001f) { v1[0]/=len1; v1[1]/=len1; v1[2]/=len1; }
-    
-    // Col 2 = Col 0 x Col 1
-    float v2[3];
-    v2[0] = v0[1]*v1[2] - v0[2]*v1[1];
-    v2[1] = v0[2]*v1[0] - v0[0]*v1[2];
-    v2[2] = v0[0]*v1[1] - v0[1]*v1[0];
-    
-    smoothed[0] = v0[0]; smoothed[1] = v0[1]; smoothed[2] = v0[2]; smoothed[3] = 0;
-    smoothed[4] = v1[0]; smoothed[5] = v1[1]; smoothed[6] = v1[2]; smoothed[7] = 0;
-    smoothed[8] = v2[0]; smoothed[9] = v2[1]; smoothed[10]= v2[2]; smoothed[11] = 0;
-    smoothed[12]= targetTransform[12]; smoothed[13]= targetTransform[13]; smoothed[14]= targetTransform[14]; smoothed[15]= 1;
-        // Lower smoothing factor means heavier smoothing. 8.0 provides a good balance for buttery smooth hands.
-    smoothFactor = 8.0f * dt;
-    if (smoothFactor > 1.0f) smoothFactor = 1.0f;
-    
-    for(int i=0; i<16; i++) {
-        smoothed[i] = lastTransform[i] + (smoothed[i] - lastTransform[i]) * smoothFactor;
-        lastTransform[i] = smoothed[i];
     }
     
     pose->bPoseIsValid = true;
     pose->bDeviceIsConnected = true;
     pose->eTrackingResult = vr::TrackingResult_Running_OK;
 
-    // Convert transform to 3x4 matrix
-    for (int i=0; i<3; i++) {
-        for (int j=0; j<4; j++) {
-            pose->mDeviceToAbsoluteTracking.m[i][j] = smoothed[j*4 + i];
+    // Apply a local rotation offset (Pitch ~ -60 degrees) because ARKit wrist origin points straight up the forearm
+    // We need the laser pointer to shoot out of the "front" of the hand holding the JoyCon.
+    float cosT = 0.5f;        // cos(-60 deg)
+    float sinT = -0.866025f;  // sin(-60 deg)
+    
+    // Create offset matrix for X-axis rotation
+    float offsetR[3][3] = {
+        {1.0f, 0.0f, 0.0f},
+        {0.0f, cosT, -sinT},
+        {0.0f, sinT, cosT}
+    };
+    
+    float correctedTransform[16];
+    for(int r=0; r<3; r++) {
+        for(int c=0; c<3; c++) {
+            correctedTransform[c*4 + r] = 0.0f;
+            for(int k=0; k<3; k++) {
+                correctedTransform[c*4 + r] += targetTransform[k*4 + r] * offsetR[k][c];
+            }
+        }
+        correctedTransform[3*4 + r] = targetTransform[3*4 + r]; // Translation remains unchanged
+    }
+    correctedTransform[3] = 0; correctedTransform[7] = 0; correctedTransform[11] = 0; correctedTransform[15] = 1;
+
+    // Use absolute raw 1:1 tracking from Vision Pro with rotation offset
+    for(int r=0; r<3; r++) {
+        for(int c=0; c<4; c++) {
+            pose->mDeviceToAbsoluteTracking.m[r][c] = correctedTransform[c*4 + r];
         }
     }
 
-    // Smooth the velocity to prevent jitter in SteamVR's forward prediction
-    float velSmooth = 6.0f * dt;
-    if (velSmooth > 1.0f) velSmooth = 1.0f;
-    lastVel[0] += (((smoothed[12] - lastTransform[12]) / dt) - lastVel[0]) * velSmooth;
-    lastVel[1] += (((smoothed[13] - lastTransform[13]) / dt) - lastVel[1]) * velSmooth;
-    lastVel[2] += (((smoothed[14] - lastTransform[14]) / dt) - lastVel[2]) * velSmooth;
-    
-    for(int i=0; i<16; i++) lastTransform[i] = smoothed[i];
-    
-    for(int r=0;r<3;r++) {
-        for(int c=0;c<3;c++) {
-            pose->mDeviceToAbsoluteTracking.m[r][c] = smoothed[c*4 + r];
+    // Calculate Velocity
+    if (dt > 0.0001f) {
+        float rawVel[3];
+        rawVel[0] = (targetTransform[12] - lastTransform[12]) / dt;
+        rawVel[1] = (targetTransform[13] - lastTransform[13]) / dt;
+        rawVel[2] = (targetTransform[14] - lastTransform[14]) / dt;
+        
+        float velSmooth = 10.0f * dt;
+        if (velSmooth > 1.0f) velSmooth = 1.0f;
+        lastVel[0] += (rawVel[0] - lastVel[0]) * velSmooth;
+        lastVel[1] += (rawVel[1] - lastVel[1]) * velSmooth;
+        lastVel[2] += (rawVel[2] - lastVel[2]) * velSmooth;
+        
+        // Calculate Angular Velocity
+        float R_prev[3][3];
+        float R_cur[3][3];
+        for(int r=0; r<3; r++) {
+            for(int c=0; c<3; c++) {
+                R_prev[r][c] = lastTransform[c*4 + r];
+                R_cur[r][c] = targetTransform[c*4 + r];
+            }
         }
+        
+        float R_delta[3][3];
+        for(int r=0; r<3; r++) {
+            for(int c=0; c<3; c++) {
+                R_delta[r][c] = 0;
+                for(int k=0; k<3; k++) {
+                    R_delta[r][c] += R_cur[r][k] * R_prev[c][k];
+                }
+            }
+        }
+        
+        float rawOmegaX = (R_delta[2][1] - R_delta[1][2]) / (2.0f * dt);
+        float rawOmegaY = (R_delta[0][2] - R_delta[2][0]) / (2.0f * dt);
+        float rawOmegaZ = (R_delta[1][0] - R_delta[0][1]) / (2.0f * dt);
+        
+        if (fabs(rawOmegaX) > 50.0f) rawOmegaX = 0;
+        if (fabs(rawOmegaY) > 50.0f) rawOmegaY = 0;
+        if (fabs(rawOmegaZ) > 50.0f) rawOmegaZ = 0;
+        
+        float angSmooth = 15.0f * dt;
+        if (angSmooth > 1.0f) angSmooth = 1.0f;
+        lastAngularVel[0] += (rawOmegaX - lastAngularVel[0]) * angSmooth;
+        lastAngularVel[1] += (rawOmegaY - lastAngularVel[1]) * angSmooth;
+        lastAngularVel[2] += (rawOmegaZ - lastAngularVel[2]) * angSmooth;
     }
     
-    // Apply smooth prediction
-    pose->mDeviceToAbsoluteTracking.m[0][3] = smoothed[12] + lastVel[0] * fPredictedSecondsToPhotonsFromNow;
-    pose->mDeviceToAbsoluteTracking.m[1][3] = smoothed[13] + lastVel[1] * fPredictedSecondsToPhotonsFromNow;
-    pose->mDeviceToAbsoluteTracking.m[2][3] = smoothed[14] + lastVel[2] * fPredictedSecondsToPhotonsFromNow;
+    // Apply SteamVR's Native Forward Prediction (Photons)
+    pose->mDeviceToAbsoluteTracking.m[0][3] += lastVel[0] * fPredictedSecondsToPhotonsFromNow;
+    pose->mDeviceToAbsoluteTracking.m[1][3] += lastVel[1] * fPredictedSecondsToPhotonsFromNow;
+    pose->mDeviceToAbsoluteTracking.m[2][3] += lastVel[2] * fPredictedSecondsToPhotonsFromNow;
     
     pose->vVelocity.v[0] = lastVel[0];
     pose->vVelocity.v[1] = lastVel[1];
     pose->vVelocity.v[2] = lastVel[2];
+    pose->vAngularVelocity.v[0] = lastAngularVel[0];
+    pose->vAngularVelocity.v[1] = lastAngularVel[1];
+    pose->vAngularVelocity.v[2] = lastAngularVel[2];
     
-    // Set angular velocity to zero since we are not calculating it to avoid rotational prediction jitter
-    pose->vAngularVelocity.v[0] = 0.0f;
-    pose->vAngularVelocity.v[1] = 0.0f;
-    pose->vAngularVelocity.v[2] = 0.0f;
+    for(int i=0; i<16; i++) lastTransform[i] = correctedTransform[i];
 }
 
 static void InitSharedMemory() {
@@ -376,9 +396,9 @@ public:
                 if (i == 0 && pSharedHands && pSharedHands->headTransform[0] != 0.0f) {
                     for(int r=0;r<3;r++) for(int c=0;c<4;c++) pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->headTransform[c*4 + r];
                 } else if (i == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
-                    ApplySmoothPose(&pTrackedDevicePoseArray[i], pSharedHands->leftTransform, g_lastLeftTransform, g_lastLeftVel, fPredictedSecondsToPhotonsFromNow, dt);
-                } else if (i == 2 && pSharedHands && pSharedHands->rightTransform[0] != 0.0f) {
-                    ApplySmoothPose(&pTrackedDevicePoseArray[i], pSharedHands->rightTransform, g_lastRightTransform, g_lastRightVel, fPredictedSecondsToPhotonsFromNow, dt);
+                    ApplySmoothPose(&pTrackedDevicePoseArray[i], pSharedHands->leftTransform, g_lastLeftTransform, g_lastLeftVel, g_lastLeftAngularVel, fPredictedSecondsToPhotonsFromNow, dt);
+                } else if (i == 2) {
+                    ApplySmoothPose(&pTrackedDevicePoseArray[i], pSharedHands->rightTransform, g_lastRightTransform, g_lastRightVel, g_lastRightAngularVel, fPredictedSecondsToPhotonsFromNow, dt);
                 } else {
                     pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1; 
                     pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1; 
@@ -435,7 +455,7 @@ public:
     }
     virtual float GetFloatTrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
         if(pError) *pError = vr::TrackedProp_Success;
-        if(prop == vr::Prop_DisplayFrequency_Float) return 120.0f;
+        if(prop == vr::Prop_DisplayFrequency_Float) return 90.0f;
         return 0.0f;
     }
     virtual int32_t GetInt32TrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
@@ -598,29 +618,45 @@ public:
                 if (unControllerDeviceIndex == 0) {
                     pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_ProximitySensor);
                 } else if (unControllerDeviceIndex == 1) {
-                    float lTrig = pSharedHands->leftTrigger / 255.0f;
-                    pControllerState->rAxis[2].x = lTrig; // Grip
-                    if (pSharedHands->leftTrigger > 128) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
-                    float lPinchVal = pSharedHands->leftPinch / 255.0f;
-                    pControllerState->rAxis[1].x = lPinchVal;
-                    if (pSharedHands->leftPinch > 128) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
-                    if ((lb & (1<<4))) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } // ZL
-                    if (lb & (1<<5)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // L3
-                    if (lb & (1<<6)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_System); // Minus
+                    // Left JoyCon Buttons
+                    // ZL (Trigger)
+                    if (lb & (1<<4)) {
+                        pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
+                        pControllerState->rAxis[1].x = 1.0f;
+                    }
+                    // SL or SR (Grip) -> Bits 7 and 8
+                    if ((lb & (1<<7)) || (lb & (1<<8))) {
+                        pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
+                        pControllerState->rAxis[2].x = 1.0f;
+                    }
+                    // L3 (Stick Click)
+                    if (lb & (1<<5)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad);
+                    // Minus (System/Menu)
+                    if (lb & (1<<6)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_System);
+                    
                     pControllerState->rAxis[0].x = pSharedHands->leftStickX;
                     pControllerState->rAxis[0].y = -pSharedHands->leftStickY;
                 } else if (unControllerDeviceIndex == 2) {
-                    float rTrig = pSharedHands->rightTrigger / 255.0f;
-                    pControllerState->rAxis[2].x = rTrig; // Grip
-                    if (pSharedHands->rightTrigger > 128) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
-                    float rPinchVal = pSharedHands->rightPinch / 255.0f;
-                    pControllerState->rAxis[1].x = rPinchVal;
-                    if (pSharedHands->rightPinch > 128) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
-                    if ((rb & (1<<2))) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } // ZR
-                    if (rb & (1<<0)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_A); // A
-                    if (rb & (1<<1)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu); // B -> App Menu
-                    if (rb & (1<<3)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // R3
-                    if (rb & (1<<4)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_System); // Plus
+                    // Right JoyCon Buttons
+                    // ZR (Trigger)
+                    if (rb & (1<<2)) {
+                        pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
+                        pControllerState->rAxis[1].x = 1.0f;
+                    }
+                    // SL or SR (Grip) -> Bits 5 and 6
+                    if ((rb & (1<<5)) || (rb & (1<<6))) {
+                        pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
+                        pControllerState->rAxis[2].x = 1.0f;
+                    }
+                    // A
+                    if (rb & (1<<0)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_A);
+                    // B
+                    if (rb & (1<<1)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu);
+                    // R3
+                    if (rb & (1<<3)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad);
+                    // Plus
+                    if (rb & (1<<4)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_System);
+                    
                     pControllerState->rAxis[0].x = pSharedHands->rightStickX;
                     pControllerState->rAxis[0].y = -pSharedHands->rightStickY;
                 }
@@ -636,9 +672,9 @@ public:
             pTrackedDevicePose->bDeviceIsConnected = true;
             pTrackedDevicePose->eTrackingResult = vr::TrackingResult_Running_OK;
             if (unControllerDeviceIndex == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
-                ApplySmoothPose(pTrackedDevicePose, pSharedHands->leftTransform, g_lastLeftTransform, g_lastLeftVel, 0.0f, 0.011f);
-            } else if (unControllerDeviceIndex == 2 && pSharedHands && pSharedHands->rightTransform[0] != 0.0f) {
-                ApplySmoothPose(pTrackedDevicePose, pSharedHands->rightTransform, g_lastRightTransform, g_lastRightVel, 0.0f, 0.011f);
+                ApplySmoothPose(pTrackedDevicePose, pSharedHands->leftTransform, g_lastLeftTransform, g_lastLeftVel, g_lastLeftAngularVel, 0.0f, 0.011f);
+            } else if (unControllerDeviceIndex == 2) {
+                ApplySmoothPose(pTrackedDevicePose, pSharedHands->rightTransform, g_lastRightTransform, g_lastRightVel, g_lastRightAngularVel, 0.0f, 0.011f);
             } else {
                 pTrackedDevicePose->mDeviceToAbsoluteTracking.m[0][0] = 1; pTrackedDevicePose->mDeviceToAbsoluteTracking.m[1][1] = 1; pTrackedDevicePose->mDeviceToAbsoluteTracking.m[2][2] = 1;
             }
@@ -1614,13 +1650,25 @@ public:
         }
         lastTime = now;
         
-        static DWORD lastWaitTime = GetTickCount();
-        DWORD nowWait = GetTickCount();
-        DWORD elapsed = nowWait - lastWaitTime;
-        if (elapsed < 8) {
-            Sleep(8 - elapsed);
+        static LARGE_INTEGER freq;
+        static bool initFreq = false;
+        if(!initFreq) { QueryPerformanceFrequency(&freq); initFreq = true; }
+        static LARGE_INTEGER lastWait;
+        
+        LARGE_INTEGER nowWait;
+        QueryPerformanceCounter(&nowWait);
+        
+        // Wait for exactly 11.1111ms (90Hz)
+        double targetWaitMs = 1000.0 / 90.0;
+        
+        if (lastWait.QuadPart != 0) {
+            double elapsedMs = (double)(nowWait.QuadPart - lastWait.QuadPart) * 1000.0 / (double)freq.QuadPart;
+            while(elapsedMs < targetWaitMs) {
+                QueryPerformanceCounter(&nowWait);
+                elapsedMs = (double)(nowWait.QuadPart - lastWait.QuadPart) * 1000.0 / (double)freq.QuadPart;
+            }
         }
-        lastWaitTime = GetTickCount();
+        lastWait = nowWait;
         
         return vr::VRCompositorError_None;
     }

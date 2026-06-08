@@ -17,6 +17,9 @@ struct VisionSpatialToolsApp: App {
                 .environmentObject(appModel)
         }
         .immersionStyle(selection: .constant(.full), in: .full)
+        .upperLimbVisibility(.hidden)
+        .persistentSystemOverlays(.hidden)
+        .defersSystemGestures(on: .all)
         
         WindowGroup(id: "SteamVRStreamer") {
             SteamVRStreamerView()

@@ -26,6 +26,8 @@ class AppModel: ObservableObject {
         magneticManager: magneticAttachmentManager
     )
 
+    let gameControllerManager = GameControllerManager()
+
     // Finger collision detector
     let fingerCollisionDetector = FingerCollisionDetector()
     
@@ -127,7 +129,13 @@ class AppModel: ObservableObject {
                 leftHand: leftT,
                 rightHand: rightT,
                 leftPinch: hands.leftHand?.isGeometryTracked ?? false, // Basic approximation
-                rightPinch: hands.rightHand?.isGeometryTracked ?? false
+                rightPinch: hands.rightHand?.isGeometryTracked ?? false,
+                leftButtons: gameControllerManager.leftButtons,
+                rightButtons: gameControllerManager.rightButtons,
+                leftStickX: gameControllerManager.leftStickX,
+                leftStickY: gameControllerManager.leftStickY,
+                rightStickX: gameControllerManager.rightStickX,
+                rightStickY: gameControllerManager.rightStickY
             )
             
             DispatchQueue.main.async { [weak self] in
