@@ -4,12 +4,7 @@
 #include <string.h>
 
 void LogMsg(const char* msg) {
-    HANDLE hFile = CreateFileA("vr_emulator_log.txt", FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        DWORD written;
-        WriteFile(hFile, msg, strlen(msg), &written, nullptr);
-        CloseHandle(hFile);
-    }
+    // Disabled
 }
 #include "openvr.h"
 #include <cstring>
@@ -434,8 +429,7 @@ public:
         return false;
     }
     virtual bool GetBoolTrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
-        FILE* f = fopen("vr_emulator_log.txt", "a");
-        if(f) { fprintf(f, "Called: IVRSystem::GetBoolTrackedDeviceProperty prop=%d\n", (int)prop); fclose(f); }
+        LogMsg("Called: IVRSystem::GetBoolTrackedDeviceProperty\n");
         if (prop == vr::Prop_DeviceProvidesBatteryStatus_Bool || prop == vr::Prop_ContainsProximitySensor_Bool) return true;
         return false;
     }
@@ -713,79 +707,79 @@ public:
     virtual void* DummyPadding17() { return nullptr; }
     virtual void* DummyPadding18() { return nullptr; }
     virtual void* DummyPadding19() { return nullptr; }
-    virtual void* DummyPadding20() { return nullptr; }
-    virtual void* DummyPadding21() { return nullptr; }
-    virtual void* DummyPadding22() { return nullptr; }
-    virtual void* DummyPadding23() { return nullptr; }
-    virtual void* DummyPadding24() { return nullptr; }
-    virtual void* DummyPadding25() { return nullptr; }
-    virtual void* DummyPadding26() { return nullptr; }
-    virtual void* DummyPadding27() { return nullptr; }
-    virtual void* DummyPadding28() { return nullptr; }
-    virtual void* DummyPadding29() { return nullptr; }
-    virtual void* DummyPadding30() { return nullptr; }
-    virtual void* DummyPadding31() { return nullptr; }
-    virtual void* DummyPadding32() { return nullptr; }
-    virtual void* DummyPadding33() { return nullptr; }
-    virtual void* DummyPadding34() { return nullptr; }
-    virtual void* DummyPadding35() { return nullptr; }
-    virtual void* DummyPadding36() { return nullptr; }
-    virtual void* DummyPadding37() { return nullptr; }
-    virtual void* DummyPadding38() { return nullptr; }
-    virtual void* DummyPadding39() { return nullptr; }
-    virtual void* DummyPadding40() { return nullptr; }
-    virtual void* DummyPadding41() { return nullptr; }
-    virtual void* DummyPadding42() { return nullptr; }
-    virtual void* DummyPadding43() { return nullptr; }
-    virtual void* DummyPadding44() { return nullptr; }
-    virtual void* DummyPadding45() { return nullptr; }
-    virtual void* DummyPadding46() { return nullptr; }
-    virtual void* DummyPadding47() { return nullptr; }
-    virtual void* DummyPadding48() { return nullptr; }
-    virtual void* DummyPadding49() { return nullptr; }
-    virtual void* DummyPadding50() { return nullptr; }
-    virtual void* DummyPadding51() { return nullptr; }
-    virtual void* DummyPadding52() { return nullptr; }
-    virtual void* DummyPadding53() { return nullptr; }
-    virtual void* DummyPadding54() { return nullptr; }
-    virtual void* DummyPadding55() { return nullptr; }
-    virtual void* DummyPadding56() { return nullptr; }
-    virtual void* DummyPadding57() { return nullptr; }
-    virtual void* DummyPadding58() { return nullptr; }
-    virtual void* DummyPadding59() { return nullptr; }
-    virtual void* DummyPadding60() { return nullptr; }
-    virtual void* DummyPadding61() { return nullptr; }
-    virtual void* DummyPadding62() { return nullptr; }
-    virtual void* DummyPadding63() { return nullptr; }
-    virtual void* DummyPadding64() { return nullptr; }
-    virtual void* DummyPadding65() { return nullptr; }
-    virtual void* DummyPadding66() { return nullptr; }
-    virtual void* DummyPadding67() { return nullptr; }
-    virtual void* DummyPadding68() { return nullptr; }
-    virtual void* DummyPadding69() { return nullptr; }
-    virtual void* DummyPadding70() { return nullptr; }
-    virtual void* DummyPadding71() { return nullptr; }
-    virtual void* DummyPadding72() { return nullptr; }
-    virtual void* DummyPadding73() { return nullptr; }
-    virtual void* DummyPadding74() { return nullptr; }
-    virtual void* DummyPadding75() { return nullptr; }
-    virtual void* DummyPadding76() { return nullptr; }
-    virtual void* DummyPadding77() { return nullptr; }
-    virtual void* DummyPadding78() { return nullptr; }
-    virtual void* DummyPadding79() { return nullptr; }
-    virtual void* DummyPadding80() { return nullptr; }
-    virtual void* DummyPadding81() { return nullptr; }
-    virtual void* DummyPadding82() { return nullptr; }
-    virtual void* DummyPadding83() { return nullptr; }
-    virtual void* DummyPadding84() { return nullptr; }
-    virtual void* DummyPadding85() { return nullptr; }
-    virtual void* DummyPadding86() { return nullptr; }
-    virtual void* DummyPadding87() { return nullptr; }
-    virtual void* DummyPadding88() { return nullptr; }
-    virtual void* DummyPadding89() { return nullptr; }
-    virtual void* DummyPadding90() { return nullptr; }
-    virtual void* DummyPadding91() { return nullptr; }
-    virtual void* DummyPadding92() { return nullptr; }
+    virtual void* Dummy20() { return nullptr; }
+    virtual void* Dummy21() { return nullptr; }
+    virtual void* Dummy22() { return nullptr; }
+    virtual void* Dummy23() { return nullptr; }
+    virtual void* Dummy24() { return nullptr; }
+    virtual void* Dummy25() { return nullptr; }
+    virtual void* Dummy26() { return nullptr; }
+    virtual void* Dummy27() { return nullptr; }
+    virtual void* Dummy28() { return nullptr; }
+    virtual void* Dummy29() { return nullptr; }
+    virtual void* Dummy30() { return nullptr; }
+    virtual void* Dummy31() { return nullptr; }
+    virtual void* Dummy32() { return nullptr; }
+    virtual void* Dummy33() { return nullptr; }
+    virtual void* Dummy34() { return nullptr; }
+    virtual void* Dummy35() { return nullptr; }
+    virtual void* Dummy36() { return nullptr; }
+    virtual void* Dummy37() { return nullptr; }
+    virtual void* Dummy38() { return nullptr; }
+    virtual void* Dummy39() { return nullptr; }
+    virtual void* Dummy40() { return nullptr; }
+    virtual void* Dummy41() { return nullptr; }
+    virtual void* Dummy42() { return nullptr; }
+    virtual void* Dummy43() { return nullptr; }
+    virtual void* Dummy44() { return nullptr; }
+    virtual void* Dummy45() { return nullptr; }
+    virtual void* Dummy46() { return nullptr; }
+    virtual void* Dummy47() { return nullptr; }
+    virtual void* Dummy48() { return nullptr; }
+    virtual void* Dummy49() { return nullptr; }
+    virtual void* Dummy50() { return nullptr; }
+    virtual void* Dummy51() { return nullptr; }
+    virtual void* Dummy52() { return nullptr; }
+    virtual void* Dummy53() { return nullptr; }
+    virtual void* Dummy54() { return nullptr; }
+    virtual void* Dummy55() { return nullptr; }
+    virtual void* Dummy56() { return nullptr; }
+    virtual void* Dummy57() { return nullptr; }
+    virtual void* Dummy58() { return nullptr; }
+    virtual void* Dummy59() { return nullptr; }
+    virtual void* Dummy60() { return nullptr; }
+    virtual void* Dummy61() { return nullptr; }
+    virtual void* Dummy62() { return nullptr; }
+    virtual void* Dummy63() { return nullptr; }
+    virtual void* Dummy64() { return nullptr; }
+    virtual void* Dummy65() { return nullptr; }
+    virtual void* Dummy66() { return nullptr; }
+    virtual void* Dummy67() { return nullptr; }
+    virtual void* Dummy68() { return nullptr; }
+    virtual void* Dummy69() { return nullptr; }
+    virtual void* Dummy70() { return nullptr; }
+    virtual void* Dummy71() { return nullptr; }
+    virtual void* Dummy72() { return nullptr; }
+    virtual void* Dummy73() { return nullptr; }
+    virtual void* Dummy74() { return nullptr; }
+    virtual void* Dummy75() { return nullptr; }
+    virtual void* Dummy76() { return nullptr; }
+    virtual void* Dummy77() { return nullptr; }
+    virtual void* Dummy78() { return nullptr; }
+    virtual void* Dummy79() { return nullptr; }
+    virtual void* Dummy80() { return nullptr; }
+    virtual void* Dummy81() { return nullptr; }
+    virtual void* Dummy82() { return nullptr; }
+    virtual void* Dummy83() { return nullptr; }
+    virtual void* Dummy84() { return nullptr; }
+    virtual void* Dummy85() { return nullptr; }
+    virtual void* Dummy86() { return nullptr; }
+    virtual void* Dummy87() { return nullptr; }
+    virtual void* Dummy88() { return nullptr; }
+    virtual void* Dummy89() { return nullptr; }
+    virtual void* Dummy90() { return nullptr; }
+    virtual void* Dummy91() { return nullptr; }
+    virtual void* Dummy92() { return nullptr; }
     virtual void* Dummy93() { return nullptr; }
     virtual void* Dummy94() { return nullptr; }
     virtual void* Dummy95() { return nullptr; }
@@ -937,50 +931,50 @@ public:
     virtual void* DummyPadding14() { return nullptr; }
     virtual void* DummyPadding15() { return nullptr; }
     virtual void* DummyPadding16() { return nullptr; }
-    virtual void* DummyPadding17() { return nullptr; }
-    virtual void* DummyPadding18() { return nullptr; }
-    virtual void* DummyPadding19() { return nullptr; }
-    virtual void* DummyPadding20() { return nullptr; }
-    virtual void* DummyPadding21() { return nullptr; }
-    virtual void* DummyPadding22() { return nullptr; }
-    virtual void* DummyPadding23() { return nullptr; }
-    virtual void* DummyPadding24() { return nullptr; }
-    virtual void* DummyPadding25() { return nullptr; }
-    virtual void* DummyPadding26() { return nullptr; }
-    virtual void* DummyPadding27() { return nullptr; }
-    virtual void* DummyPadding28() { return nullptr; }
-    virtual void* DummyPadding29() { return nullptr; }
-    virtual void* DummyPadding30() { return nullptr; }
-    virtual void* DummyPadding31() { return nullptr; }
-    virtual void* DummyPadding32() { return nullptr; }
-    virtual void* DummyPadding33() { return nullptr; }
-    virtual void* DummyPadding34() { return nullptr; }
-    virtual void* DummyPadding35() { return nullptr; }
-    virtual void* DummyPadding36() { return nullptr; }
-    virtual void* DummyPadding37() { return nullptr; }
-    virtual void* DummyPadding38() { return nullptr; }
-    virtual void* DummyPadding39() { return nullptr; }
-    virtual void* DummyPadding40() { return nullptr; }
-    virtual void* DummyPadding41() { return nullptr; }
-    virtual void* DummyPadding42() { return nullptr; }
-    virtual void* DummyPadding43() { return nullptr; }
-    virtual void* DummyPadding44() { return nullptr; }
-    virtual void* DummyPadding45() { return nullptr; }
-    virtual void* DummyPadding46() { return nullptr; }
-    virtual void* DummyPadding47() { return nullptr; }
-    virtual void* DummyPadding48() { return nullptr; }
-    virtual void* DummyPadding49() { return nullptr; }
-    virtual void* DummyPadding50() { return nullptr; }
-    virtual void* DummyPadding51() { return nullptr; }
-    virtual void* DummyPadding52() { return nullptr; }
-    virtual void* DummyPadding53() { return nullptr; }
-    virtual void* DummyPadding54() { return nullptr; }
-    virtual void* DummyPadding55() { return nullptr; }
-    virtual void* DummyPadding56() { return nullptr; }
-    virtual void* DummyPadding57() { return nullptr; }
-    virtual void* DummyPadding58() { return nullptr; }
-    virtual void* DummyPadding59() { return nullptr; }
-    virtual void* DummyPadding60() { return nullptr; }
+    virtual void* Dummy17() { return nullptr; }
+    virtual void* Dummy18() { return nullptr; }
+    virtual void* Dummy19() { return nullptr; }
+    virtual void* Dummy20() { return nullptr; }
+    virtual void* Dummy21() { return nullptr; }
+    virtual void* Dummy22() { return nullptr; }
+    virtual void* Dummy23() { return nullptr; }
+    virtual void* Dummy24() { return nullptr; }
+    virtual void* Dummy25() { return nullptr; }
+    virtual void* Dummy26() { return nullptr; }
+    virtual void* Dummy27() { return nullptr; }
+    virtual void* Dummy28() { return nullptr; }
+    virtual void* Dummy29() { return nullptr; }
+    virtual void* Dummy30() { return nullptr; }
+    virtual void* Dummy31() { return nullptr; }
+    virtual void* Dummy32() { return nullptr; }
+    virtual void* Dummy33() { return nullptr; }
+    virtual void* Dummy34() { return nullptr; }
+    virtual void* Dummy35() { return nullptr; }
+    virtual void* Dummy36() { return nullptr; }
+    virtual void* Dummy37() { return nullptr; }
+    virtual void* Dummy38() { return nullptr; }
+    virtual void* Dummy39() { return nullptr; }
+    virtual void* Dummy40() { return nullptr; }
+    virtual void* Dummy41() { return nullptr; }
+    virtual void* Dummy42() { return nullptr; }
+    virtual void* Dummy43() { return nullptr; }
+    virtual void* Dummy44() { return nullptr; }
+    virtual void* Dummy45() { return nullptr; }
+    virtual void* Dummy46() { return nullptr; }
+    virtual void* Dummy47() { return nullptr; }
+    virtual void* Dummy48() { return nullptr; }
+    virtual void* Dummy49() { return nullptr; }
+    virtual void* Dummy50() { return nullptr; }
+    virtual void* Dummy51() { return nullptr; }
+    virtual void* Dummy52() { return nullptr; }
+    virtual void* Dummy53() { return nullptr; }
+    virtual void* Dummy54() { return nullptr; }
+    virtual void* Dummy55() { return nullptr; }
+    virtual void* Dummy56() { return nullptr; }
+    virtual void* Dummy57() { return nullptr; }
+    virtual void* Dummy58() { return nullptr; }
+    virtual void* Dummy59() { return nullptr; }
+    virtual void* Dummy60() { return nullptr; }
     virtual void* Dummy61() { return nullptr; }
     virtual void* Dummy62() { return nullptr; }
     virtual void* Dummy63() { return nullptr; }
@@ -1072,51 +1066,51 @@ public:
     virtual void* DummyPadding6() { return nullptr; }
     virtual void* DummyPadding7() { return nullptr; }
     virtual void* DummyPadding8() { return nullptr; }
-    virtual void* DummyPadding9() { return nullptr; }
-    virtual void* DummyPadding10() { return nullptr; }
-    virtual void* DummyPadding11() { return nullptr; }
-    virtual void* DummyPadding12() { return nullptr; }
-    virtual void* DummyPadding13() { return nullptr; }
-    virtual void* DummyPadding14() { return nullptr; }
-    virtual void* DummyPadding15() { return nullptr; }
-    virtual void* DummyPadding16() { return nullptr; }
-    virtual void* DummyPadding17() { return nullptr; }
-    virtual void* DummyPadding18() { return nullptr; }
-    virtual void* DummyPadding19() { return nullptr; }
-    virtual void* DummyPadding20() { return nullptr; }
-    virtual void* DummyPadding21() { return nullptr; }
-    virtual void* DummyPadding22() { return nullptr; }
-    virtual void* DummyPadding23() { return nullptr; }
-    virtual void* DummyPadding24() { return nullptr; }
-    virtual void* DummyPadding25() { return nullptr; }
-    virtual void* DummyPadding26() { return nullptr; }
-    virtual void* DummyPadding27() { return nullptr; }
-    virtual void* DummyPadding28() { return nullptr; }
-    virtual void* DummyPadding29() { return nullptr; }
-    virtual void* DummyPadding30() { return nullptr; }
-    virtual void* DummyPadding31() { return nullptr; }
-    virtual void* DummyPadding32() { return nullptr; }
-    virtual void* DummyPadding33() { return nullptr; }
-    virtual void* DummyPadding34() { return nullptr; }
-    virtual void* DummyPadding35() { return nullptr; }
-    virtual void* DummyPadding36() { return nullptr; }
-    virtual void* DummyPadding37() { return nullptr; }
-    virtual void* DummyPadding38() { return nullptr; }
-    virtual void* DummyPadding39() { return nullptr; }
-    virtual void* DummyPadding40() { return nullptr; }
-    virtual void* DummyPadding41() { return nullptr; }
-    virtual void* DummyPadding42() { return nullptr; }
-    virtual void* DummyPadding43() { return nullptr; }
-    virtual void* DummyPadding44() { return nullptr; }
-    virtual void* DummyPadding45() { return nullptr; }
-    virtual void* DummyPadding46() { return nullptr; }
-    virtual void* DummyPadding47() { return nullptr; }
-    virtual void* DummyPadding48() { return nullptr; }
-    virtual void* DummyPadding49() { return nullptr; }
-    virtual void* DummyPadding50() { return nullptr; }
-    virtual void* DummyPadding51() { return nullptr; }
-    virtual void* DummyPadding52() { return nullptr; }
-    virtual void* DummyPadding53() { return nullptr; }
+    virtual void* Dummy9() { return nullptr; }
+    virtual void* Dummy10() { return nullptr; }
+    virtual void* Dummy11() { return nullptr; }
+    virtual void* Dummy12() { return nullptr; }
+    virtual void* Dummy13() { return nullptr; }
+    virtual void* Dummy14() { return nullptr; }
+    virtual void* Dummy15() { return nullptr; }
+    virtual void* Dummy16() { return nullptr; }
+    virtual void* Dummy17() { return nullptr; }
+    virtual void* Dummy18() { return nullptr; }
+    virtual void* Dummy19() { return nullptr; }
+    virtual void* Dummy20() { return nullptr; }
+    virtual void* Dummy21() { return nullptr; }
+    virtual void* Dummy22() { return nullptr; }
+    virtual void* Dummy23() { return nullptr; }
+    virtual void* Dummy24() { return nullptr; }
+    virtual void* Dummy25() { return nullptr; }
+    virtual void* Dummy26() { return nullptr; }
+    virtual void* Dummy27() { return nullptr; }
+    virtual void* Dummy28() { return nullptr; }
+    virtual void* Dummy29() { return nullptr; }
+    virtual void* Dummy30() { return nullptr; }
+    virtual void* Dummy31() { return nullptr; }
+    virtual void* Dummy32() { return nullptr; }
+    virtual void* Dummy33() { return nullptr; }
+    virtual void* Dummy34() { return nullptr; }
+    virtual void* Dummy35() { return nullptr; }
+    virtual void* Dummy36() { return nullptr; }
+    virtual void* Dummy37() { return nullptr; }
+    virtual void* Dummy38() { return nullptr; }
+    virtual void* Dummy39() { return nullptr; }
+    virtual void* Dummy40() { return nullptr; }
+    virtual void* Dummy41() { return nullptr; }
+    virtual void* Dummy42() { return nullptr; }
+    virtual void* Dummy43() { return nullptr; }
+    virtual void* Dummy44() { return nullptr; }
+    virtual void* Dummy45() { return nullptr; }
+    virtual void* Dummy46() { return nullptr; }
+    virtual void* Dummy47() { return nullptr; }
+    virtual void* Dummy48() { return nullptr; }
+    virtual void* Dummy49() { return nullptr; }
+    virtual void* Dummy50() { return nullptr; }
+    virtual void* Dummy51() { return nullptr; }
+    virtual void* Dummy52() { return nullptr; }
+    virtual void* Dummy53() { return nullptr; }
     virtual void* Dummy54() { return nullptr; }
     virtual void* Dummy55() { return nullptr; }
     virtual void* Dummy56() { return nullptr; }
@@ -1227,44 +1221,44 @@ public:
     virtual void* DummyPadding11() { return nullptr; }
     virtual void* DummyPadding12() { return nullptr; }
     virtual void* DummyPadding13() { return nullptr; }
-    virtual void* DummyPadding14() { return nullptr; }
-    virtual void* DummyPadding15() { return nullptr; }
-    virtual void* DummyPadding16() { return nullptr; }
-    virtual void* DummyPadding17() { return nullptr; }
-    virtual void* DummyPadding18() { return nullptr; }
-    virtual void* DummyPadding19() { return nullptr; }
-    virtual void* DummyPadding20() { return nullptr; }
-    virtual void* DummyPadding21() { return nullptr; }
-    virtual void* DummyPadding22() { return nullptr; }
-    virtual void* DummyPadding23() { return nullptr; }
-    virtual void* DummyPadding24() { return nullptr; }
-    virtual void* DummyPadding25() { return nullptr; }
-    virtual void* DummyPadding26() { return nullptr; }
-    virtual void* DummyPadding27() { return nullptr; }
-    virtual void* DummyPadding28() { return nullptr; }
-    virtual void* DummyPadding29() { return nullptr; }
-    virtual void* DummyPadding30() { return nullptr; }
-    virtual void* DummyPadding31() { return nullptr; }
-    virtual void* DummyPadding32() { return nullptr; }
-    virtual void* DummyPadding33() { return nullptr; }
-    virtual void* DummyPadding34() { return nullptr; }
-    virtual void* DummyPadding35() { return nullptr; }
-    virtual void* DummyPadding36() { return nullptr; }
-    virtual void* DummyPadding37() { return nullptr; }
-    virtual void* DummyPadding38() { return nullptr; }
-    virtual void* DummyPadding39() { return nullptr; }
-    virtual void* DummyPadding40() { return nullptr; }
-    virtual void* DummyPadding41() { return nullptr; }
+    virtual void* Dummy14() { return nullptr; }
+    virtual void* Dummy15() { return nullptr; }
+    virtual void* Dummy16() { return nullptr; }
+    virtual void* Dummy17() { return nullptr; }
+    virtual void* Dummy18() { return nullptr; }
+    virtual void* Dummy19() { return nullptr; }
+    virtual void* Dummy20() { return nullptr; }
+    virtual void* Dummy21() { return nullptr; }
+    virtual void* Dummy22() { return nullptr; }
+    virtual void* Dummy23() { return nullptr; }
+    virtual void* Dummy24() { return nullptr; }
+    virtual void* Dummy25() { return nullptr; }
+    virtual void* Dummy26() { return nullptr; }
+    virtual void* Dummy27() { return nullptr; }
+    virtual void* Dummy28() { return nullptr; }
+    virtual void* Dummy29() { return nullptr; }
+    virtual void* Dummy30() { return nullptr; }
+    virtual void* Dummy31() { return nullptr; }
+    virtual void* Dummy32() { return nullptr; }
+    virtual void* Dummy33() { return nullptr; }
+    virtual void* Dummy34() { return nullptr; }
+    virtual void* Dummy35() { return nullptr; }
+    virtual void* Dummy36() { return nullptr; }
+    virtual void* Dummy37() { return nullptr; }
+    virtual void* Dummy38() { return nullptr; }
+    virtual void* Dummy39() { return nullptr; }
+    virtual void* Dummy40() { return nullptr; }
+    virtual void* Dummy41() { return nullptr; }
     virtual void* Dummy42() { return nullptr; }
-    virtual void* DummyPadding43() { return nullptr; }
-    virtual void* DummyPadding44() { return nullptr; }
-    virtual void* DummyPadding45() { return nullptr; }
-    virtual void* DummyPadding46() { return nullptr; }
-    virtual void* DummyPadding47() { return nullptr; }
-    virtual void* DummyPadding48() { return nullptr; }
-    virtual void* DummyPadding49() { return nullptr; }
-    virtual void* DummyPadding50() { return nullptr; }
-    virtual void* DummyPadding51() { return nullptr; }
+    virtual void* Dummy43() { return nullptr; }
+    virtual void* Dummy44() { return nullptr; }
+    virtual void* Dummy45() { return nullptr; }
+    virtual void* Dummy46() { return nullptr; }
+    virtual void* Dummy47() { return nullptr; }
+    virtual void* Dummy48() { return nullptr; }
+    virtual void* Dummy49() { return nullptr; }
+    virtual void* Dummy50() { return nullptr; }
+    virtual void* Dummy51() { return nullptr; }
     virtual void* Dummy52() { return nullptr; }
     virtual void* Dummy53() { return nullptr; }
     virtual void* Dummy54() { return nullptr; }
@@ -1399,51 +1393,51 @@ public:
     virtual void* DummyPadding9() { return nullptr; }
     virtual void* DummyPadding10() { return nullptr; }
     virtual void* DummyPadding11() { return nullptr; }
-    virtual void* DummyPadding12() { return nullptr; }
-    virtual void* DummyPadding13() { return nullptr; }
-    virtual void* DummyPadding14() { return nullptr; }
-    virtual void* DummyPadding15() { return nullptr; }
-    virtual void* DummyPadding16() { return nullptr; }
-    virtual void* DummyPadding17() { return nullptr; }
-    virtual void* DummyPadding18() { return nullptr; }
-    virtual void* DummyPadding19() { return nullptr; }
-    virtual void* DummyPadding20() { return nullptr; }
-    virtual void* DummyPadding21() { return nullptr; }
-    virtual void* DummyPadding22() { return nullptr; }
-    virtual void* DummyPadding23() { return nullptr; }
-    virtual void* DummyPadding24() { return nullptr; }
-    virtual void* DummyPadding25() { return nullptr; }
-    virtual void* DummyPadding26() { return nullptr; }
-    virtual void* DummyPadding27() { return nullptr; }
-    virtual void* DummyPadding28() { return nullptr; }
-    virtual void* DummyPadding29() { return nullptr; }
-    virtual void* DummyPadding30() { return nullptr; }
-    virtual void* DummyPadding31() { return nullptr; }
-    virtual void* DummyPadding32() { return nullptr; }
-    virtual void* DummyPadding33() { return nullptr; }
-    virtual void* DummyPadding34() { return nullptr; }
-    virtual void* DummyPadding35() { return nullptr; }
-    virtual void* DummyPadding36() { return nullptr; }
-    virtual void* DummyPadding37() { return nullptr; }
-    virtual void* DummyPadding38() { return nullptr; }
-    virtual void* DummyPadding39() { return nullptr; }
-    virtual void* DummyPadding40() { return nullptr; }
-    virtual void* DummyPadding41() { return nullptr; }
-    virtual void* DummyPadding42() { return nullptr; }
-    virtual void* DummyPadding43() { return nullptr; }
-    virtual void* DummyPadding44() { return nullptr; }
-    virtual void* DummyPadding45() { return nullptr; }
-    virtual void* DummyPadding46() { return nullptr; }
-    virtual void* DummyPadding47() { return nullptr; }
-    virtual void* DummyPadding48() { return nullptr; }
-    virtual void* DummyPadding49() { return nullptr; }
-    virtual void* DummyPadding50() { return nullptr; }
-    virtual void* DummyPadding51() { return nullptr; }
-    virtual void* DummyPadding52() { return nullptr; }
-    virtual void* DummyPadding53() { return nullptr; }
-    virtual void* DummyPadding54() { return nullptr; }
-    virtual void* DummyPadding55() { return nullptr; }
-    virtual void* DummyPadding56() { return nullptr; }
+    virtual void* Dummy12() { return nullptr; }
+    virtual void* Dummy13() { return nullptr; }
+    virtual void* Dummy14() { return nullptr; }
+    virtual void* Dummy15() { return nullptr; }
+    virtual void* Dummy16() { return nullptr; }
+    virtual void* Dummy17() { return nullptr; }
+    virtual void* Dummy18() { return nullptr; }
+    virtual void* Dummy19() { return nullptr; }
+    virtual void* Dummy20() { return nullptr; }
+    virtual void* Dummy21() { return nullptr; }
+    virtual void* Dummy22() { return nullptr; }
+    virtual void* Dummy23() { return nullptr; }
+    virtual void* Dummy24() { return nullptr; }
+    virtual void* Dummy25() { return nullptr; }
+    virtual void* Dummy26() { return nullptr; }
+    virtual void* Dummy27() { return nullptr; }
+    virtual void* Dummy28() { return nullptr; }
+    virtual void* Dummy29() { return nullptr; }
+    virtual void* Dummy30() { return nullptr; }
+    virtual void* Dummy31() { return nullptr; }
+    virtual void* Dummy32() { return nullptr; }
+    virtual void* Dummy33() { return nullptr; }
+    virtual void* Dummy34() { return nullptr; }
+    virtual void* Dummy35() { return nullptr; }
+    virtual void* Dummy36() { return nullptr; }
+    virtual void* Dummy37() { return nullptr; }
+    virtual void* Dummy38() { return nullptr; }
+    virtual void* Dummy39() { return nullptr; }
+    virtual void* Dummy40() { return nullptr; }
+    virtual void* Dummy41() { return nullptr; }
+    virtual void* Dummy42() { return nullptr; }
+    virtual void* Dummy43() { return nullptr; }
+    virtual void* Dummy44() { return nullptr; }
+    virtual void* Dummy45() { return nullptr; }
+    virtual void* Dummy46() { return nullptr; }
+    virtual void* Dummy47() { return nullptr; }
+    virtual void* Dummy48() { return nullptr; }
+    virtual void* Dummy49() { return nullptr; }
+    virtual void* Dummy50() { return nullptr; }
+    virtual void* Dummy51() { return nullptr; }
+    virtual void* Dummy52() { return nullptr; }
+    virtual void* Dummy53() { return nullptr; }
+    virtual void* Dummy54() { return nullptr; }
+    virtual void* Dummy55() { return nullptr; }
+    virtual void* Dummy56() { return nullptr; }
     virtual void* Dummy57() { return nullptr; }
     virtual void* Dummy58() { return nullptr; }
     virtual void* Dummy59() { return nullptr; }
@@ -1520,13 +1514,7 @@ public:
                         static bool printedMatrix = false;
                         if (!printedMatrix) {
                             printedMatrix = true;
-                            FILE* f = fopen("vr_emulator_log.txt", "a");
-                            if (f) {
-                                fprintf(f, "HEAD TRANSFORM: ");
-                                for(int k=0; k<16; k++) fprintf(f, "%f ", srcTransform[k]);
-                                fprintf(f, "\n");
-                                fclose(f);
-                            }
+                            // disabled
                         }
                         for(int r=0;r<3;r++) for(int c=0;c<4;c++) pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = srcTransform[c*4 + r];
                         if (i > 0 && srcTransform == pSharedHands->headTransform) {
