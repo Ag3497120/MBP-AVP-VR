@@ -59,6 +59,7 @@ struct ImmersiveView: View {
             }
         }
         .upperLimbVisibility(.hidden)
+        .persistentSystemOverlays(.hidden)
         .gesture(
             SpatialTapGesture()
                 .targetedToAnyEntity()

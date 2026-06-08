@@ -494,7 +494,7 @@ while isEncoding {
             
             if width > 0 && height > 0 {
                 if pixelBuffer == nil {
-                    CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
+                    CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32RGBA, nil, &pixelBuffer)
                 }
                 
                 if let pb = pixelBuffer {

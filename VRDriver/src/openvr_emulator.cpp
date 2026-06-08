@@ -336,7 +336,7 @@ public:
         static auto startTime = std::chrono::steady_clock::now();
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - startTime).count();
-        double frameDuration = 1.0 / 90.0;
+        double frameDuration = 1.0 / 120.0;
         if (pulFrameCounter) *pulFrameCounter = (uint64_t)(elapsed / frameDuration);
         if (pfSecondsSinceLastVsync) {
             uint64_t fcount = (uint64_t)(elapsed / frameDuration);
