@@ -37,6 +37,9 @@ class AppModel: ObservableObject {
     @Published var framesReceived: Int = 0
     @Published var isSendingTracking: Bool = false
 
+    // Last known hand transforms to prevent teleporting to the floor when holding Joy-Cons
+    private var lastLeftHandTransform = matrix_identity_float4x4
+    private var lastRightHandTransform = matrix_identity_float4x4
 
     // vx-browser 移植版 ViewModel
     let vxTabManager       = VxTabManager()
@@ -113,15 +116,17 @@ class AppModel: ObservableObject {
             guard let deviceAnchor = worldTrackingProvider.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()) else { continue }
             
             let headT = deviceAnchor.originFromAnchorTransform
-            var leftT = matrix_identity_float4x4
-            var rightT = matrix_identity_float4x4
+            var leftT = self.lastLeftHandTransform
+            var rightT = self.lastRightHandTransform
             
             let hands = handTrackingProvider.latestAnchors
             if let left = hands.leftHand, left.isTracked {
                 leftT = left.originFromAnchorTransform
+                self.lastLeftHandTransform = leftT
             }
             if let right = hands.rightHand, right.isTracked {
                 rightT = right.originFromAnchorTransform
+                self.lastRightHandTransform = rightT
             }
             
             vrUDPSender.sendPose(
