@@ -26,9 +26,9 @@ class VRVideoDecoder: ObservableObject {
     private let frameDuration: CMTime
 
     init() {
-        // 60fps想定。Macの送信側も timescale=90, value=framesEncoded なので
-        // 1/90000秒を単位として使う。
-        frameDuration = CMTime(value: 1500, timescale: timeScale) // ~60fps
+        // 120fps想定。SteamVRの120Hz化に合わせる
+        // 1/90000秒を単位として使う。90000 / 120 = 750
+        frameDuration = CMTime(value: 750, timescale: timeScale) // 120fps
 
         displayLayer.videoGravity = .resizeAspect
 
@@ -220,7 +220,7 @@ class VRVideoDecoder: ObservableObject {
 
         // タイムスタンプを単調増加させる（表示が確実に行われるよう）
         frameCounter += 1
-        let pts = CMTime(value: frameCounter * 1500, timescale: timeScale)
+        let pts = CMTime(value: frameCounter * 750, timescale: timeScale)
 
         var timingInfo = CMSampleTimingInfo(
             duration: frameDuration,
