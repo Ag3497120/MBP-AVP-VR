@@ -20,6 +20,13 @@ void LogMsg(const char* msg) {
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <chrono>
+#include <cmath>
+#include <fstream>
+#include <map>
+#include <windows.h>
+#include <d3d11.h>
+#include <d3d11_4.h>
+#include <chrono>
 
 struct SharedFrame {
     uint32_t sequenceNumber;
@@ -95,13 +102,12 @@ void ApplySmoothPose(vr::TrackedDevicePose_t* pose, float* targetTransform, floa
     v2[1] = v0[2]*v1[0] - v0[0]*v1[2];
     v2[2] = v0[0]*v1[1] - v0[1]*v1[0];
     
-    float smoothed[16];
     smoothed[0] = v0[0]; smoothed[1] = v0[1]; smoothed[2] = v0[2]; smoothed[3] = 0;
     smoothed[4] = v1[0]; smoothed[5] = v1[1]; smoothed[6] = v1[2]; smoothed[7] = 0;
     smoothed[8] = v2[0]; smoothed[9] = v2[1]; smoothed[10]= v2[2]; smoothed[11] = 0;
     smoothed[12]= targetTransform[12]; smoothed[13]= targetTransform[13]; smoothed[14]= targetTransform[14]; smoothed[15]= 1;
         // Lower smoothing factor means heavier smoothing. 8.0 provides a good balance for buttery smooth hands.
-    float smoothFactor = 8.0f * dt;
+    smoothFactor = 8.0f * dt;
     if (smoothFactor > 1.0f) smoothFactor = 1.0f;
     
     for(int i=0; i<16; i++) {
@@ -435,7 +441,7 @@ public:
     }
     virtual float GetFloatTrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
         if(pError) *pError = vr::TrackedProp_Success;
-        if(prop == vr::Prop_DisplayFrequency_Float) return 90.0f;
+        if(prop == vr::Prop_DisplayFrequency_Float) return 120.0f;
         return 0.0f;
     }
     virtual int32_t GetInt32TrackedDeviceProperty(vr::TrackedDeviceIndex_t unDeviceIndex, ETrackedDeviceProperty prop, ETrackedPropertyError *pError = 0L) override {
@@ -529,13 +535,13 @@ public:
             uint64_t currentLeftVRButtons = 0;
             uint64_t currentRightVRButtons = 0;
             
-            if (pSharedHands->leftPinch) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
+            if (pSharedHands->leftPinch > 128) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
             if (pSharedHands->leftTrigger > 128) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
             if (lb & (1<<4)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); // ZL
             if (lb & (1<<5)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // L3
             if (lb & (1<<6)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_System); // Minus
 
-            if (pSharedHands->rightPinch) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
+            if (pSharedHands->rightPinch > 128) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
             if (pSharedHands->rightTrigger > 128) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
             if (rb & (1<<2)) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); // ZR
             if (rb & (1<<0)) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_A); // A
@@ -601,7 +607,9 @@ public:
                     float lTrig = pSharedHands->leftTrigger / 255.0f;
                     pControllerState->rAxis[2].x = lTrig; // Grip
                     if (pSharedHands->leftTrigger > 128) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
-                    if (pSharedHands->leftPinch) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } else { pControllerState->rAxis[1].x = 0.0f; }
+                    float lPinchVal = pSharedHands->leftPinch / 255.0f;
+                    pControllerState->rAxis[1].x = lPinchVal;
+                    if (pSharedHands->leftPinch > 128) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
                     if ((lb & (1<<4))) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } // ZL
                     if (lb & (1<<5)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // L3
                     if (lb & (1<<6)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_System); // Minus
@@ -611,7 +619,9 @@ public:
                     float rTrig = pSharedHands->rightTrigger / 255.0f;
                     pControllerState->rAxis[2].x = rTrig; // Grip
                     if (pSharedHands->rightTrigger > 128) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
-                    if (pSharedHands->rightPinch) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } else { pControllerState->rAxis[1].x = 0.0f; }
+                    float rPinchVal = pSharedHands->rightPinch / 255.0f;
+                    pControllerState->rAxis[1].x = rPinchVal;
+                    if (pSharedHands->rightPinch > 128) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
                     if ((rb & (1<<2))) { pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); pControllerState->rAxis[1].x = 1.0f; } // ZR
                     if (rb & (1<<0)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_A); // A
                     if (rb & (1<<1)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu); // B -> App Menu
@@ -1587,8 +1597,10 @@ public:
             float cL[3] = { pSharedHands->leftTransform[12], pSharedHands->leftTransform[13], pSharedHands->leftTransform[14] };
             float cR[3] = { pSharedHands->rightTransform[12], pSharedHands->rightTransform[13], pSharedHands->rightTransform[14] };
             
-            g_handVelocityL[0] = (cL[0]-lastLeft[0])/dt; g_handVelocityL[1] = (cL[1]-lastLeft[1])/dt; g_handVelocityL[2] = (cL[2]-lastLeft[2])/dt;
-            g_handVelocityR[0] = (cR[0]-lastRight[0])/dt; g_handVelocityR[1] = (cR[1]-lastRight[1])/dt; g_handVelocityR[2] = (cR[2]-lastRight[2])/dt;
+            // Set velocities to zero. Vision Pro sends data at 250Hz.
+            // Allowing SteamVR to predict motion causes extreme jitter in Alyx.
+            g_handVelocityL[0] = 0.0f; g_handVelocityL[1] = 0.0f; g_handVelocityL[2] = 0.0f;
+            g_handVelocityR[0] = 0.0f; g_handVelocityR[1] = 0.0f; g_handVelocityR[2] = 0.0f;
             
             if (pRenderPoseArray && unRenderPoseArrayCount > 1) {
                 pRenderPoseArray[1].vVelocity.v[0] = g_handVelocityL[0]; pRenderPoseArray[1].vVelocity.v[1] = g_handVelocityL[1]; pRenderPoseArray[1].vVelocity.v[2] = g_handVelocityL[2];
