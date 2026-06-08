@@ -1,212 +1,157 @@
-# Verantyx-Mirage: The Ultimate Ultra-Low Latency VR Steaming Architecture
+# Verantyx-Mirage: The Ultimate Ultra-Low Latency VR Streaming Architecture
 
-![Verantyx Mirage Logo](https://via.placeholder.com/1000x300?text=Verantyx+Mirage)
+> **A native stereoscopic VR engine for Mac and Apple Vision Pro. Bypasses D3DMetal IPC constraints to stream x86 AAA PCVR titles (e.g., Source 2) at 120Hz/150Mbps via low-level C++ `openvr_api.dll` VTable hooking, direct memory mapping, and visionOS hardware compositing—complete with controller-free full hand tracking.**
 
-## 目次 (Table of Contents)
-
-1. [イントロダクション＆ビジョン (Introduction & Vision)](#イントロダクションビジョン-introduction--vision)
-2. [システムアーキテクチャとデータフロー (System Architecture & Data Flow)](#システムアーキテクチャとデータフロー-system-architecture--data-flow)
-    - [Macホスト側: Game Porting Toolkit (D3DMetal)](#macホスト側-game-porting-toolkit-d3dmetal)
-    - [OpenVRエミュレーター: SteamVRの完全バイパス](#openvrエミュレーター-steamvrの完全バイパス)
-    - [HardwareEncoder: Apple VideoToolboxの極限駆動](#hardwareencoder-apple-videotoolboxの極限駆動)
-    - [Vision Proクライアント: AVSampleBufferDisplayLayerと高速デコード](#vision-proクライアント-avsamplebufferdisplaylayerと高速デコード)
-3. [究極のフルハンドトラッキング・エンジン (Ultimate Full Hand Tracking Engine)](#究極のフルハンドトラッキングエンジン-ultimate-full-hand-tracking-engine)
-    - [ハンドトラッキングの基礎と骨格データ](#ハンドトラッキングの基礎と骨格データ)
-    - [ジェスチャーの判定ロジック](#ジェスチャーの判定ロジック)
-    - [仮想ジョイスティック（リスト・ローテーション・マッピング）](#仮想ジョイスティックリストローテーションマッピング)
-4. [ディープダイブ: 採用テクノロジーの裏側 (Deep Dive: Technologies Used)](#ディープダイブ-採用テクノロジーの裏側-deep-dive-technologies-used)
-    - [Color Correction: vImageによる超高速チャンネルスワップ](#color-correction-vimageによる超高速チャンネルスワップ)
-    - [独自UDPプロトコルとパケットフラグメンテーション](#独自udpプロトコルとパケットフラグメンテーション)
-    - [COMインターフェースのリバースエンジニアリングとVTableフック](#comインターフェースのリバースエンジニアリングとvtableフック)
-5. [セットアップと使い方 (Setup & Installation Guide)](#セットアップと使い方-setup--installation-guide)
-    - [必須要件 (Requirements)](#必須要件-requirements)
-    - [リポジトリのクローンとビルド](#リポジトリのクローンとビルド)
-    - [起動プロセス](#起動プロセス)
-6. [トラブルシューティング (Troubleshooting)](#トラブルシューティング-troubleshooting)
+## Table of Contents
+1. [Introduction & The "Mirage" Concept](#1-introduction--the-mirage-concept)
+2. [System Architecture & Data Flow (Deep Technical Dive)](#2-system-architecture--data-flow-deep-technical-dive)
+    - [Game Porting Toolkit (D3DMetal)](#game-porting-toolkit-d3dmetal)
+    - [The OpenVR Mocking Engine (`openvr_api.dll`)](#the-openvr-mocking-engine-openvr_apidll)
+    - [Shared Memory IPC (`vr_shared_frame.dat`)](#shared-memory-ipc-vr_shared_framedat)
+    - [HardwareEncoder (Swift)](#hardwareencoder-swift)
+3. [The Ultimate Full Hand Tracking Engine](#3-the-ultimate-full-hand-tracking-engine)
+    - [Skeletal Joint Calculations](#skeletal-joint-calculations)
+    - [Gesture Recognition Logic](#gesture-recognition-logic)
+    - [The Virtual Joystick (Locomotion)](#the-virtual-joystick-locomotion)
+4. [Custom UDP Networking Protocol (`VRAN`)](#4-custom-udp-networking-protocol-vran)
+    - [AWDL / Bonjour Discovery](#awdl--bonjour-discovery)
+    - [Packet Fragmentation & I-Frame Recovery](#packet-fragmentation--i-frame-recovery)
+5. [Setup & Installation Guide](#5-setup--installation-guide)
+    - [Requirements](#requirements)
+    - [Cloning and Compilation](#cloning-and-compilation)
+    - [Boot Sequence](#boot-sequence)
+6. [Troubleshooting](#6-troubleshooting)
 
 ---
 
-## 1. イントロダクション＆ビジョン (Introduction & Vision)
+## 1. Introduction & The "Mirage" Concept
 
-**Verantyx-Mirage**は、Mac上で動作するハイエンドVRゲーム（例: *Half-Life: Alyx*）を、Apple Vision ProなどのスタンドアロンVRヘッドセットに対して、**究極の超低遅延（Ultra-Low Latency）かつ高画質（150Mbps, 120Hz）でストリーミングする**ためのフルスクラッチ・アーキテクチャです。
+Conventional VR streaming solutions (such as Virtual Desktop or Steam Link) rely heavily on the SteamVR compositor. They capture frames *after* they have been processed by SteamVR, incurring substantial IPC overhead, process switching delays, and unpredictable frame pacing.
 
-### 「Mirage（蜃気楼）」のコンセプト
-従来のVRストリーミング（Virtual Desktop, Steam Linkなど）は、SteamVRのコンポジターを介して映像を取得し、ネットワーク経由で送信します。しかし、SteamVRのコンポジターを経由すること自体が、ミリ秒単位の遅延や、オーバーヘッドを生み出します。
-
-Mirageは、**SteamVRを完全にバイパス**します。
-自作のカスタムOpenVR DLL（`openvr_api.dll`）をゲーム本体に直接注入し、ゲームエンジンが生成したDirectX 11のテクスチャを、SteamVRに渡す前に**共有メモリ（Shared Memory）**に直接ダンプします。これにより、ゲームエンジンからエンコーダーまでのパスが最短化され、事実上「蜃気楼」のように、ネイティブ実行と区別がつかないレベルの遅延を実現します。
+**Verantyx-Mirage** eliminates the middleman. We engineered a complete C++ proxy DLL (`openvr_api.dll`) that forcibly injects itself into the game process. By mimicking the VTable structure of SteamVR's COM interfaces, we trick the game engine (like Half-Life: Alyx's Source 2 engine) into directly handing us raw DirectX 11 textures. We instantly dump these textures into shared memory and compress them using Apple's hardware media engine (VideoToolbox). The result is a "Mirage"—an illusion so perfectly orchestrated that the game believes it's rendering to a tethered PCVR headset, while delivering a wireless 120Hz retinal experience to the Apple Vision Pro.
 
 ---
 
-## 2. システムアーキテクチャとデータフロー (System Architecture & Data Flow)
+## 2. System Architecture & Data Flow (Deep Technical Dive)
 
-システム全体は、以下の4つの主要なコンポーネントで構成されており、それぞれが緊密に連携して動作します。
+### Game Porting Toolkit (D3DMetal)
+We rely on Apple's **Game Porting Toolkit (GPTK)**, specifically the **D3DMetal** translation layer. When we launch `hlvr.exe` via Wine with the `-dx11` flag, D3DMetal intercepts all DirectX 11 API calls and translates them directly into native Apple Metal API calls. **Vulkan (and DXVK) are completely bypassed**, eliminating an entire translation step and unlocking native-level Metal performance on Apple Silicon.
 
-### Macホスト側: Game Porting Toolkit (D3DMetal)
-Mac上でWindows向けのAAAタイトル（Half-Life: Alyxなど）を動かすため、Appleの**Game Porting Toolkit (GPTK)** に組み込まれている **D3DMetal** を利用しています。
-これはDirectX 11/12のAPI呼び出しをVulkan等の他APIを一切経由せず、**AppleネイティブのMetal APIへダイレクトに変換**する技術です。独自の起動スクリプト（`launch_vision_pro_vr.sh`）を用いて、`hlvr.exe`（`-dx11` モード）をWine経由で起動します。この際、`WINEDLLOVERRIDES`を使用して、本物の`openvr_api.dll`の代わりに、私たちが作成したカスタムエミュレーターDLLを強制的に読み込ませます。
+### The OpenVR Mocking Engine (`openvr_api.dll`)
+Located in `VRDriver/src/openvr_emulator.cpp`, this is the heart of the hijacking system. OpenVR is built on C++ COM interfaces with virtual function tables (VTables). We reverse-engineered the memory layout of `IVRSystem`, `IVRCompositor`, and `IVRSettings`.
+To prevent segmentation faults caused by missing vtable entries, our `UniversalMock` class injects precisely 100 dummy padding functions (`Dummy0()` to `Dummy99()`). This guarantees memory alignment.
+When the game calls `IVRCompositor::Submit()`, instead of sending the frame to SteamVR, our emulator extracts the `ID3D11Texture2D` object directly.
 
-### OpenVRエミュレーター: SteamVRの完全バイパス
-`VRDriver/src/openvr_emulator.cpp` が本システムの心臓部の一つです。
-ゲームエンジンはVRヘッドセットと通信するために、OpenVRのAPI（`IVRSystem`, `IVRCompositor`, `IVRSettings`など）を呼び出します。このエミュレーターは、これらのCOMインターフェースを完全に模倣（モック）します。
+### Shared Memory IPC (`vr_shared_frame.dat`)
+Inter-Process Communication (IPC) is the enemy of low latency. We use an ultra-fast memory-mapped file `C:\vr_shared_frame.dat` mapped via `CreateFileMappingA`.
+- **Texture Staging**: A CPU-readable `ID3D11Texture2D` staging buffer is created. The raw 4K NV12/BGRA pixel data is copied from VRAM to RAM.
+- **The Payload**: The memory map consists of a 16-byte header, the raw pixel buffer, and a `SharedHands` struct (236 bytes) containing full `simd_float4x4` transform matrices, button states, and stick states from the Vision Pro. This bidirectional memory pool allows the Mac encoder and the Windows game process to communicate synchronously at 120Hz.
 
-1. **ポーズの提供**: Vision Proから受信した頭と手のトラッキング情報をゲームに渡します。
-2. **テクスチャのキャプチャ**: ゲームが `IVRCompositor::Submit` を呼び出した瞬間、渡されたDirect3D 11のテクスチャ（左右の目の映像）をキャプチャします。
-3. **共有メモリへのダンプ**: キャプチャしたテクスチャの生ピクセルデータを、`vr_shared_frame.dat` という巨大なメモリマップドファイル（Shared Memory）に高速に書き込みます。
-
-### HardwareEncoder: Apple VideoToolboxの極限駆動
-共有メモリに書き込まれた生ピクセルデータは、別プロセスとして常駐している `HardwareEncoder.swift` によって即座に読み取られます。
-
-- **Apple VideoToolboxの活用**: Macの強力なメディアエンジン（ハードウェアエンコーダー）を直接叩きます。
-- **超低遅延設定**: `kVTCompressionPropertyKey_AllowFrameReordering` を `false` に設定し、Bフレームを無効化。さらに `kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality` を `true` にすることで、品質よりもエンコード速度を極限まで優先します。
-- **150Mbps / 120fpsの網膜ストリーミング**: ビットレートを150,000,000 bps（150Mbps）に設定し、圧縮ノイズを完全に排除。さらにエンコーダーのターゲットFPSを120fpsに指定し、現実世界と見紛うほどの滑らかさを実現しています。
-
-### Vision Proクライアント: AVSampleBufferDisplayLayerと高速デコード
-Vision Pro側のアプリ（`vision-spatial-tools`）は、Macから送られてくるUDPパケットを受信します。
-パケットの欠損や順序の入れ替えに対処するため、カスタムのフレームアセンブラーがフラグメント化されたUDPパケットを瞬時に結合し、完全なH.265 (HEVC) のNALユニットを復元します。
-復元されたフレームは `AVSampleBufferDisplayLayer` に流し込まれ、Vision Proのハードウェアデコーダーによってゼロ遅延で空間上にレンダリングされます。
+### HardwareEncoder (Swift)
+Located in `MacEncoder/HardwareEncoder.swift`, this standalone macOS daemon continuously polls the shared memory.
+- **Color Correction**: D3DMetal outputs BGRA, but Apple's VideoToolbox requires ARGB or NV12 formats, resulting in blue-skinned characters if encoded natively. We utilize Apple's `Accelerate` framework (`vImagePermuteChannels_ARGB8888`) to execute SIMD hardware-accelerated Red/Blue channel swapping in less than 1ms for a 4K frame.
+- **VideoToolbox Extremes**: We drive the hardware HEVC encoder at extreme parameters:
+  - `kVTCompressionPropertyKey_AllowFrameReordering = false` (Disables B-Frames).
+  - `kVTCompressionPropertyKey_ExpectedFrameRate = 120` (Paced for 120fps).
+  - `kVTCompressionPropertyKey_AverageBitRate = 150_000_000` (150 Mbps for zero artifacting).
+  - `kVTCompressionPropertyKey_MaxKeyFrameInterval = 60` (I-Frame every 0.5s for immediate packet loss recovery).
 
 ---
 
-## 3. 究極のフルハンドトラッキング・エンジン (Ultimate Full Hand Tracking Engine)
+## 3. The Ultimate Full Hand Tracking Engine
 
-物理的なコントローラー（Joy-ConやVRコントローラー）を一切使用せず、**プレイヤーの「手」そのものをコントローラーにする**革新的な入力システムを実装しています。
+We completely eradicated the need for physical controllers (e.g., Joy-Cons). We leverage VisionOS's `HandTrackingProvider` to turn your bare hands into precision VR input devices.
 
-### ハンドトラッキングの基礎と骨格データ
-Vision ProのARKitが提供する `HandTrackingProvider` を使用し、手の骨格（HandSkeleton）の25個の関節（Joint）の3D座標を毎秒90回以上の超高頻度で取得します。
-手首（Wrist）や各指の先端（Tip）、指の根本（Knuckle）などの空間座標（`simd_float4x4`）を抽出し、それらの「相対距離」をミリ秒単位で計算します。
+### Skeletal Joint Calculations
+In `VisionProClient/VisionSpatialToolsApp/VisionSpatialTools/VisionSpatialTools/Models/AppModel.swift`, we track 25 skeletal joints per hand. Using `simd_distance`, we calculate the precise physical distance between spatial points (e.g., `.thumbTip` and `.indexFingerTip`).
 
-### ジェスチャーの判定ロジック
-抽出した関節座標をもとに、以下のジェスチャーを判定し、OpenVRのコントローラー入力に変換しています。
+### Gesture Recognition Logic
+We map organic human movements to discrete OpenVR `VRControllerState_t` axis and button inputs:
+- **Trigger (Fire / Select)**: Distance between Thumb Tip and Index Tip `< 0.025m (2.5cm)`. This sets the OpenVR trigger axis (`rAxis[1].x`) to `1.0`.
+- **Grip (Grab / Gravity Gloves)**: Distance between Middle, Ring, and Pinky Tips to the Palm Center `< 0.06m (6.0cm)`. Sets the OpenVR grip axis (`rAxis[2].x`).
+- **A Button**: Thumb Tip to Ring Tip `< 2.5cm`.
+- **B Button**: Thumb Tip to Pinky Tip `< 2.5cm`.
 
-1. **トリガー（銃を撃つ / 選択）**:
-   - **判定**: `親指の先端` と `人差し指の先端` の距離が2.5cm以内（Pinch）。
-   - **マッピング**: OpenVRのTrigger軸（0〜255）としてMacへ送信。
-2. **グリップ（物を掴む / グラビティ・グローブ）**:
-   - **判定**: `中指・薬指・小指` が手のひら（中指の根本）に向かって曲げられ、距離が6cm以内（Fist）。
-   - **マッピング**: OpenVRのGrip軸（0〜255）として送信。
-3. **Aボタン（武器変更 / テレポートなど）**:
-   - **判定**: `親指の先端` と `薬指の先端` の距離が2.5cm以内。
-   - **マッピング**: 仮想コントローラーの Aボタン（右） / D-PAD 下（左）にマッピング。
-4. **Bボタン（メニュー / 弾倉ドロップなど）**:
-   - **判定**: `親指の先端` と `小指の先端` の距離が2.5cm以内。
-   - **マッピング**: 仮想コントローラーの Bボタン（右） / D-PAD 右（左）にマッピング。
-
-### 仮想ジョイスティック（リスト・ローテーション・マッピング）
-VR空間での移動（ロコモーション）と旋回を実現するため、**「手をジョイスティックに見立てる」**特殊なロジックを実装しています。
-
-- **発動条件**: `親指の先端` と `中指の先端` をくっつける（Pinch）。
-- **ニュートラル・アンカーの固定**: くっつけた瞬間の「手首の角度（Transform）」をメモリに記憶（アンカー）します。
-- **アナログ入力の計算**: 指をくっつけたまま手首を前後に傾ける（Pitch）と、アンカーからの相対角度が計算され、ジョイスティックのY軸（前進・後退）に変換されます。左右に傾ける（Roll）とX軸（旋回・カニ歩き）になります。
-- **解除**: 指を離すと、ジョイスティックは即座に中央（0.0, 0.0）に戻ります。
-
-このトラッキングデータとボタン入力は、Vision ProからMacへのUDPパケット（`POSE` ペイロード）に24バイトの追加データとしてパッキングされ、Macの `HardwareEncoder` がそれを受け取って共有メモリに書き込みます。
+### The Virtual Joystick (Locomotion)
+To simulate an analog thumbstick for walking and turning, we created a revolutionary "Virtual Joystick" mechanic.
+1. When the user pinches their Thumb and Middle finger together, we capture the hand's current rotational matrix as the **Neutral Anchor**.
+2. As the user tilts their wrist (Pitch) while holding the pinch, we calculate `matrix_multiply(simd_inverse(neutral), currentRot)`.
+3. The extracted Pitch translates to `Stick Y` (Forward/Backward), and Roll translates to `Stick X` (Strafe/Turn).
+Releasing the pinch instantly snaps the analog stick back to `0.0, 0.0`.
 
 ---
 
-## 4. ディープダイブ: 採用テクノロジーの裏側 (Deep Dive: Technologies Used)
+## 4. Custom UDP Networking Protocol (`VRAN`)
 
-### Color Correction: vImageによる超高速チャンネルスワップ
-Macのハードウェアエンコーダー（VideoToolbox）に入力するピクセルバッファ（`CVPixelBuffer`）は、Macがネイティブで最も得意とする `kCVPixelFormatType_32BGRA` を使用する必要があります。しかし、ゲームエンジンが生成するテクスチャは一般的に `RGBA` 形式です。
-そのままエンコードすると、赤（Red）と青（Blue）が反転し、肌が青く見える「アバター状態」になってしまいます。
+Standard TCP is catastrophic for VR streaming due to Head-of-Line blocking and retransmission delays. We built a pure, fragmented UDP pipeline.
 
-これをソフトウェアでピクセルごとにループ処理して入れ替えると、CPU負荷が跳ね上がり、フレームレートが大幅に低下します。
-そこで、Appleの **Accelerateフレームワーク（vImage）** を導入しました。
-`vImagePermuteChannels_ARGB8888` を使用し、SIMD（ベクトル演算）命令レベルで Rチャンネルと Bチャンネルを入れ替える処理を実装。これにより、**4K解像度の画像変換を1ミリ秒未満のゼロ・オーバーヘッドで完了**させ、完璧な色彩（Half-Life: Alyxの美しいオレンジや赤）を取り戻しました。
+### AWDL / Bonjour Discovery
+The Mac encoder and the Vision Pro discover each other instantly using Apple Wireless Direct Link (AWDL) and `_verantyxvr._udp` Bonjour broadcasts. By connecting directly to the Mac's Internet Sharing Wi-Fi AP, we completely bypass router latency.
 
-### 独自UDPプロトコルとパケットフラグメンテーション
-VRの映像ストリーミングにおいて、TCPはパケット到達保証のための再送（Retransmission）処理が発生し、深刻な遅延（スタッター）を引き起こすため使用できません。
-私たちは**完全にピュアなUDP**による通信スタックを構築しました。
-
-1. **AWDLとBonjour**: Vision ProとMacの接続は、Apple Wireless Direct Link (AWDL) と Bonjour (`_verantyxvr._udp`) を使用して、IPアドレスを自動検出し、ルーターを経由しない超高速なP2P通信を確立します。
-2. **`VRAN` ヘッダー**: 1フレームのH.265データはMTU（通常1500バイト）を超えるため、Mac側でデータを1400バイトごとに分割し、独自の `VRAN` ヘッダー（Sequence Number, Chunk Index, Total Chunks）を付与して送信します。
-3. **I-Frame強制リカバリ**: UDPパケットが欠損した場合、そのフレームのデコードは失敗しますが、VideoToolboxの `kVTCompressionPropertyKey_MaxKeyFrameInterval` を `60` に設定しているため、わずか0.5秒以内に次の完全なキーフレーム（I-Frame）が到着し、画面の乱れが即座に自己修復されます。
-
-### COMインターフェースのリバースエンジニアリングとVTableフック
-OpenVRはC++の仮想関数テーブル（VTable）に依存するCOMアーキテクチャを採用しています。
-SteamVRをバイパスするためには、ゲームエンジンに対して「自分こそがSteamVRだ」と信じ込ませる必要があります。
-私たちは、最新の `openvr.h` を解析し、`IVRSystem` や `IVRCompositor` などのインターフェースの仮想関数の**宣言順序と引数の型を完全に一致させたモッククラス**を作成しました。
-ゲームが呼び出さない不要な関数については、パディング用のダミー関数（`Dummy1()`, `Dummy2()`...）を正確な数だけ配置し、メモリレイアウトのズレによるアクセス違反（セグメンテーションフォールト）を完全に防いでいます。
+### Packet Fragmentation & I-Frame Recovery
+A 4K HEVC encoded frame vastly exceeds the standard 1500-byte UDP MTU.
+1. The Swift encoder splits the `CMSampleBuffer` into `1400-byte` fragments.
+2. Each fragment is prepended with a custom 16-byte `VRAN` header (`Sequence Number`, `Chunk Index`, `Total Chunks`).
+3. `VisionClientCompositor.swift` receives these chunks, drops incomplete sequences to prevent decoding corruption, and assembles full NAL units.
+4. The NAL units are fed into `AVSampleBufferDisplayLayer` for zero-latency hardware decoding. If a packet is lost, the encoder's 0.5s I-Frame interval guarantees immediate visual recovery.
 
 ---
 
-## 5. セットアップと使い方 (Setup & Installation Guide)
+## 5. Setup & Installation Guide
 
-この強力なVRストリーミング環境を構築・実行するための手順です。
+### Requirements
+- Apple Silicon Mac (M1/M2/M3)
+- Apple Vision Pro
+- macOS Sonoma or newer
+- Xcode 15 or newer
+- Game Porting Toolkit (GPTK / D3DMetal)
+- Windows Steam + Half-Life: Alyx (installed inside the GPTK Wine prefix)
+- MinGW (`x86_64-w64-mingw32-g++`), Python 3, Swift compiler
 
-### 必須要件 (Requirements)
-- **ハードウェア**:
-  - Apple Silicon搭載 Mac (M1/M2/M3)
-  - Apple Vision Pro
-- **ソフトウェア**:
-  - macOS Sonoma 以降
-  - Xcode 15 以降
-  - Game Porting Toolkit (GPTK / D3DMetal)
-  - Steam & Half-Life: Alyx (Windows版をGPTK内にインストール済みであること)
-  - Homebrew, MinGW (`x86_64-w64-mingw32-g++`), Python 3, Swiftコンパイラ
+### Cloning and Compilation
 
-### リポジトリのクローンとビルド
+This repository consolidates the OpenVR emulator, the Mac Hardware Encoder, and the Vision Pro Client.
 
-このシステムは複数のリポジトリにまたがっています。
-
-#### 1. Mac側ホスト環境のクローン
 ```bash
-# メインのMac側エミュレーター環境
+# Clone the unified repository
 git clone https://github.com/Ag3497120/Verantyx-Mirage.git
+cd Verantyx-Mirage
 
-# エンコーダーやCLIツールを含むリポジトリ
-git clone https://github.com/Ag3497120/verantyx-cli.git
-```
-
-#### 2. OpenVR エミュレーター（DLL）のコンパイル
-Windows互換のDLLをビルドするため、MinGWクロスコンパイラを使用します。
-```bash
-cd Verantyx-Mirage/VRDriver/src
+# 1. Compile the OpenVR Emulator DLL (Cross-compile to Windows DLL)
+cd VRDriver/src
 x86_64-w64-mingw32-g++ -shared -static-libgcc -static-libstdc++ -I../include openvr_emulator.cpp ../openvr_api.def -o openvr_api.dll
 
-# ビルドしたDLLをSteamVR配下のゲームディレクトリにコピー
+# Replace the game's actual openvr_api.dll with our mock DLL
 cp openvr_api.dll "$HOME/Verantyx_VR_Drive/SteamVR_Prefix/drive_c/Program Files (x86)/Steam/steamapps/common/Half-Life Alyx/game/bin/win64/openvr_api.dll"
-```
 
-#### 3. ハードウェアエンコーダーのビルド
-```bash
-cd ../../../verantyx-cli/cli
+# 2. Compile the Mac Hardware Encoder
+cd ../../MacEncoder
 swiftc HardwareEncoder.swift -o HardwareEncoder -O
 ```
 
-#### 4. Vision Pro クライアントのクローンとビルド
-*（注意: 現在vision-spatial-toolsリポジトリはArchivedとなっていますが、ソースコードへのアクセス権がある前提の手順です）*
-```bash
-git clone https://github.com/Ag3497120/VisionSpatialTools.git
-```
-- Xcodeを開き、`VisionSpatialToolsApp.xcodeproj` を開きます。
-- ターゲットデバイスとして「Apple Vision Pro」を選択します。
-- `Command + R` を押してビルドし、デバイスにアプリをインストール・実行します。
+### 3. Deploying the Vision Pro Client
+Open `VisionProClient/VisionSpatialToolsApp/VisionSpatialToolsApp.xcodeproj` in Xcode. Select your Apple Vision Pro as the target, and press `Cmd + R` to build and run the immersive app.
 
-### 起動プロセス
-
-1. **ネットワーク共有**:
-   Macの「システム設定」>「一般」>「共有」から「インターネット共有」をオンにし、Vision ProをMacのWi-Fiネットワーク（Direct AP）に接続します。これによりルーターをバイパスします。
-2. **Mac側での起動**:
-   ターミナルを開き、以下のスクリプトを実行します。
+### Boot Sequence
+1. Enable **Internet Sharing** on your Mac (System Settings > General > Sharing) and connect your Vision Pro to this direct Wi-Fi network.
+2. Launch the server script:
    ```bash
    cd ~/Verantyx-Mirage/scripts
    ./launch_vision_pro_vr.sh
    ```
-   このスクリプトが自動的に `HardwareEncoder` をバックグラウンドで起動し、続いてGPTK経由で `Half-Life: Alyx` を起動します。
-3. **Vision Pro側での接続**:
-   Vision Proでアプリを開きます。BonjourによってMacが自動検出され、映像のストリーミングとハンドトラッキングデータの送信が開始されます。
+   This script spins up the `HardwareEncoder` daemon and then boots `hlvr.exe` via Wine/D3DMetal.
+3. Put on your Vision Pro. The client will automatically discover the Mac via Bonjour and stream the 120Hz VR matrix straight into your eyes.
 
 ---
 
-## 6. トラブルシューティング (Troubleshooting)
+## 6. Troubleshooting
 
-- **Q. 映像の色がおかしい（肌が青い、全体が青みがかっている）**
-  - **A.** `HardwareEncoder.swift` 内の `vImagePermuteChannels_ARGB8888` 処理が正常にコンパイルされているか確認してください。ゲーム側のバッファ形式が変更された可能性があります。
-- **Q. ゲームが起動直後にクラッシュする**
-  - **A.** `openvr_emulator.cpp` のVTableパディング（`DummyX()` の数）が、ゲームが期待する `IVRSystem` のバージョンと一致していない可能性があります。SteamVRのアップデート等で構造体が変わった場合は、`openvr.h` の差分を確認して修正してください。
-- **Q. 手の動きがカクつく、映像が飛ぶ**
-  - **A.** MacとVision Proの通信にルーターが介在している可能性があります。必ずMacの「インターネット共有」機能を使って、Vision ProをMacに直接Wi-Fi接続してください。
+- **Symptom: The screen is blue (Smurf characters).**
+  - **Fix**: The BGRA to ARGB `vImage` permutation in `HardwareEncoder.swift` failed. Ensure you are compiling with `-O` to enable Accelerate optimizations.
+- **Symptom: Game crashes immediately upon opening.**
+  - **Fix**: The VTable signature for `IVRSystem` may have changed in a recent SteamVR update. You must manually verify `openvr.h` and update the `Dummy()` padding counts in `openvr_emulator.cpp` to prevent segfaults.
+- **Symptom: Severe visual stuttering.**
+  - **Fix**: You are likely routed through a physical router. Connect the Vision Pro **directly** to the Mac's Internet Sharing Access Point to avoid local network congestion.
 
 ---
-*Created and maintained by the Verantyx Advanced AI Team.*
+*Architected and developed by the Verantyx Advanced AI Team.*
