@@ -1,4 +1,4 @@
-# AVP-MVP-VR: The Ultimate Ultra-Low Latency VR Streaming Architecture
+# MBP-AVP-VR: The Ultimate Ultra-Low Latency VR Streaming Architecture
 
 > **A native stereoscopic VR engine for Mac and Apple Vision Pro. Bypasses D3DMetal IPC constraints to stream x86 AAA PCVR titles (e.g., Source 2) at 120Hz/150Mbps via low-level C++ `openvr_api.dll` VTable hooking, direct memory mapping, and visionOS hardware compositing—complete with controller-free full hand tracking.**
 
@@ -28,7 +28,7 @@
 
 Conventional VR streaming solutions (such as Virtual Desktop or Steam Link) rely heavily on the SteamVR compositor. They capture frames *after* they have been processed by SteamVR, incurring substantial IPC overhead, process switching delays, and unpredictable frame pacing.
 
-**AVP-MVP-VR** eliminates the middleman. We engineered a complete C++ proxy DLL (`openvr_api.dll`) that forcibly injects itself into the game process. By mimicking the VTable structure of SteamVR's COM interfaces, we trick the game engine (like Half-Life: Alyx's Source 2 engine) into directly handing us raw DirectX 11 textures. We instantly dump these textures into shared memory and compress them using Apple's hardware media engine (VideoToolbox). The result is a "Mirage"—an illusion so perfectly orchestrated that the game believes it's rendering to a tethered PCVR headset, while delivering a wireless 120Hz retinal experience to the Apple Vision Pro.
+**MBP-AVP-VR** eliminates the middleman. We engineered a complete C++ proxy DLL (`openvr_api.dll`) that forcibly injects itself into the game process. By mimicking the VTable structure of SteamVR's COM interfaces, we trick the game engine (like Half-Life: Alyx's Source 2 engine) into directly handing us raw DirectX 11 textures. We instantly dump these textures into shared memory and compress them using Apple's hardware media engine (VideoToolbox). The result is a "Mirage"—an illusion so perfectly orchestrated that the game believes it's rendering to a tethered PCVR headset, while delivering a wireless 120Hz retinal experience to the Apple Vision Pro.
 
 ---
 
@@ -114,8 +114,8 @@ This repository consolidates the OpenVR emulator, the Mac Hardware Encoder, and 
 
 ```bash
 # Clone the unified repository
-git clone https://github.com/Ag3497120/AVP-MVP-VR.git
-cd AVP-MVP-VR
+git clone https://github.com/Ag3497120/MBP-AVP-VR.git
+cd MBP-AVP-VR
 
 # 1. Compile the OpenVR Emulator DLL (Cross-compile to Windows DLL)
 cd VRDriver/src
@@ -136,7 +136,7 @@ Open `VisionProClient/VisionSpatialToolsApp/VisionSpatialToolsApp.xcodeproj` in 
 1. Enable **Internet Sharing** on your Mac (System Settings > General > Sharing) and connect your Vision Pro to this direct Wi-Fi network.
 2. Launch the server script:
    ```bash
-   cd ~/AVP-MVP-VR/scripts
+   cd ~/MBP-AVP-VR/scripts
    ./launch_vision_pro_vr.sh
    ```
    This script spins up the `HardwareEncoder` daemon and then boots `hlvr.exe` via Wine/D3DMetal.
