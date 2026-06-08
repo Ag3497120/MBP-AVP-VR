@@ -186,12 +186,8 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
                 }
             }
             
-            // Smart Pacing: Send 20 packets (~28KB) instantly, then yield for 1ms.
-            // P-frames (typically <20 packets) will transmit in 0ms.
-            // I-frames (~700 packets) will transmit smoothly over ~35ms without overflowing the Vision Pro network buffer!
-            if i % 20 == 19 {
-                usleep(1000)
-            }
+            // Smart Pacing disabled for Direct AP connection (Internet Sharing) to minimize latency
+            // if i % 20 == 19 { usleep(1000) }
         }
     }
 }
@@ -273,7 +269,7 @@ func setupEncoder(width: Int32, height: Int32) {
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse) // Disable B-frames
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
     
-    var bitrate: Int32 = 25_000_000 // Bump to 25 Mbps for ultra-high quality direct AP streaming
+    var bitrate: Int32 = 100_000_000 // Bump to 100 Mbps for ultra-high quality direct AP streaming
     let bitrateNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &bitrate)
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateNum)
     

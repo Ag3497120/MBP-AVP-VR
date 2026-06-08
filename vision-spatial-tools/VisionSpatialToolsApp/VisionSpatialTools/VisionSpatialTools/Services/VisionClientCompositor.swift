@@ -214,7 +214,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
     
     // MARK: - Pose Upload
     
-    public func sendPose(head: simd_float4x4, leftHand: simd_float4x4, rightHand: simd_float4x4, leftPinch: Bool, rightPinch: Bool, leftTrigger: Bool, rightTrigger: Bool) {
+    public func sendPose(head: simd_float4x4, leftHand: simd_float4x4, rightHand: simd_float4x4, leftPinch: UInt8, rightPinch: UInt8, leftTrigger: UInt8, rightTrigger: UInt8) {
         guard isTrackingConnectionReady, let trackingConnection = trackingConnection else { return }
         
         var packetData = Data()
@@ -248,10 +248,10 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         appendMatrix(leftHand)
         appendMatrix(rightHand)
         
-        var lPinch: UInt8 = leftPinch ? 1 : 0
-        var rPinch: UInt8 = rightPinch ? 1 : 0
-        var lTrig: UInt8 = leftTrigger ? 1 : 0
-        var rTrig: UInt8 = rightTrigger ? 1 : 0
+        var lPinch: UInt8 = leftPinch
+        var rPinch: UInt8 = rightPinch
+        var lTrig: UInt8 = leftTrigger
+        var rTrig: UInt8 = rightTrigger
         
         packetData.append(Data(bytes: &lPinch, count: 1))
         packetData.append(Data(bytes: &rPinch, count: 1))

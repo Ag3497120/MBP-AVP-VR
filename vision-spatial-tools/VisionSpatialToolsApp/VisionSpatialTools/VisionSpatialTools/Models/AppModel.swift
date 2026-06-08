@@ -46,14 +46,13 @@ class AppModel: ObservableObject {
     // Metal レンダーループ（バックグラウンドスレッド）と
     // ネットワークコールバックの両方から安全にアクセスできる
     nonisolated(unsafe) private let _pixelBufferLock = NSLock()
-    nonisolated(unsafe) private var _presentationQueue: [CVPixelBuffer] = []
+    nonisolated(unsafe) private var _presentationQueue: [(CVPixelBuffer, Double)] = []
     nonisolated(unsafe) private var _lastPoppedPixelBuffer: CVPixelBuffer? = nil
     nonisolated(unsafe) private var _latestTimestamp: Double = 0.0
     
     nonisolated func setLatestPixelBuffer(_ pb: CVPixelBuffer, timestamp: Double) {
         _pixelBufferLock.lock()
-        _presentationQueue.append(pb)
-        _latestTimestamp = timestamp
+        _presentationQueue.append((pb, timestamp))
         // Keep latency low by dropping older frames if the queue grows too large (e.g. > 3 frames)
         if _presentationQueue.count > 3 {
             _presentationQueue.removeFirst(_presentationQueue.count - 3)
@@ -65,7 +64,9 @@ class AppModel: ObservableObject {
         _pixelBufferLock.lock()
         defer { _pixelBufferLock.unlock() }
         if !_presentationQueue.isEmpty {
-            _lastPoppedPixelBuffer = _presentationQueue.removeFirst()
+            let popped = _presentationQueue.removeFirst()
+            _lastPoppedPixelBuffer = popped.0
+            _latestTimestamp = popped.1 // Update ATW timestamp ONLY when the frame is presented
         }
         return _lastPoppedPixelBuffer
     }
@@ -249,7 +250,8 @@ class AppModel: ObservableObject {
     
     private func processTrackingForVR() async {
         while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 11_111_111) // ~90fps
+            // Poll at 250Hz (4ms) to ensure we always grab the very latest anchor as soon as ARKit produces it!
+            try? await Task.sleep(nanoseconds: 4_000_000)
             
             // Predict ~45ms into the future to account for network, render, encode, and decode latency.
             // This allows the PC to render the frame for where the head WILL be, eliminating black pull-in on fast head turns.
@@ -265,93 +267,119 @@ class AppModel: ObservableObject {
             
             let hands = handTrackingProvider.state == .running ? handTrackingProvider.latestAnchors : (leftHand: nil, rightHand: nil)
             
-            func getPalmTransform(hand: HandAnchor?) -> simd_float4x4? {
+            func getPalmTransform(hand: HandAnchor?, isRight: Bool) -> simd_float4x4? {
                 guard let hand = hand, hand.isTracked else { return nil }
                 
+                var transform = hand.originFromAnchorTransform
+                
+                // Vision Pro HandAnchor orientation:
+                // +Z points out of the back of the hand. +Y points up (towards thumb). +X points right.
+                // OpenVR Controller (Valve Index) orientation:
+                // -Z points forward (laser pointer). +Y points up (from button face). +X points right.
+                
+                // 腕の位置（肘から手首へのベクトル）を算出して手の向きをさらに安定させる
                 if let skeleton = hand.handSkeleton {
-                    let knuckle = skeleton.joint(.middleFingerKnuckle)
-                    if knuckle.isTracked {
-                        return matrix_multiply(hand.originFromAnchorTransform, knuckle.anchorFromJointTransform)
-                    }
+                   let elbow = skeleton.joint(.forearmArm)
+                   let forearmWrist = skeleton.joint(.forearmWrist)
+                   
+                   if elbow.isTracked && forearmWrist.isTracked {
+                    
+                    // 肘と手首の位置をワールド座標に変換
+                    let elbowPos = matrix_multiply(transform, elbow.anchorFromJointTransform).columns.3
+                    let wristPos = matrix_multiply(transform, forearmWrist.anchorFromJointTransform).columns.3
+                    
+                    // 腕の方向ベクトル（肘から手首へ）
+                    let forearmDir = simd_normalize(simd_make_float3(wristPos.x - elbowPos.x, wristPos.y - elbowPos.y, wristPos.z - elbowPos.z))
+                    
+                    // 手の位置を少し腕側に寄せることで、手首の微細なブレを吸収して位置を固定する
+                    let positionOffset = forearmDir * -0.05 // 手首から5cm腕側にコントローラーの原点を置く
+                    transform.columns.3.x += positionOffset.x
+                    transform.columns.3.y += positionOffset.y
+                    transform.columns.3.z += positionOffset.z
+                   }
                 }
                 
-                // Fallback to wrist if knuckle isn't tracked (e.g. holding Joy-Con)
-                return hand.originFromAnchorTransform
+                // Adjust rotation to perfectly align the real hand with the VR game hand
+                let angleX = Float.pi / 2.0 // Pitch
+                let angleY = isRight ? -Float.pi / 2.0 : Float.pi / 2.0 // Yaw
+                
+                let rotX = simd_float4x4(
+                    simd_float4(1, 0, 0, 0),
+                    simd_float4(0, cos(angleX), sin(angleX), 0),
+                    simd_float4(0, -sin(angleX), cos(angleX), 0),
+                    simd_float4(0, 0, 0, 1)
+                )
+                let rotY = simd_float4x4(
+                    simd_float4(cos(angleY), 0, -sin(angleY), 0),
+                    simd_float4(0, 1, 0, 0),
+                    simd_float4(sin(angleY), 0, cos(angleY), 0),
+                    simd_float4(0, 0, 0, 1)
+                )
+                
+                transform = matrix_multiply(transform, rotY)
+                transform = matrix_multiply(transform, rotX)
+                
+                return transform
             }
             
-            if let palmT = getPalmTransform(hand: hands.leftHand) {
+            if let palmT = getPalmTransform(hand: hands.leftHand, isRight: false) {
                 leftT = palmT
             }
-            if let palmT = getPalmTransform(hand: hands.rightHand) {
+            if let palmT = getPalmTransform(hand: hands.rightHand, isRight: true) {
                 rightT = palmT
             }
             
-            func getHandInputs(hand: HandAnchor?, isRight: Bool) -> (buttons: UInt32, stickX: Float, stickY: Float) {
+            func getHandInputs(hand: HandAnchor?, isRight: Bool) -> (trigger: UInt8, grip: UInt8) {
                 guard let hand = hand, hand.isTracked, let skeleton = hand.handSkeleton else {
-                    return (0, 0, 0)
+                    return (0, 0)
                 }
-                
-                var buttons: UInt32 = 0
                 
                 let thumb = skeleton.joint(.thumbTip)
                 let index = skeleton.joint(.indexFingerTip)
                 let middle = skeleton.joint(.middleFingerTip)
                 let ring = skeleton.joint(.ringFingerTip)
-                let pinky = skeleton.joint(.littleFingerTip)
                 let wrist = skeleton.joint(.wrist)
                 
-                guard thumb.isTracked && index.isTracked && middle.isTracked && ring.isTracked && pinky.isTracked && wrist.isTracked else {
-                    return (0, 0, 0)
+                guard thumb.isTracked && index.isTracked && middle.isTracked && ring.isTracked && wrist.isTracked else {
+                    return (0, 0)
                 }
                 
                 let thumbPos = thumb.anchorFromJointTransform.columns.3
                 let indexPos = index.anchorFromJointTransform.columns.3
                 let middlePos = middle.anchorFromJointTransform.columns.3
                 let ringPos = ring.anchorFromJointTransform.columns.3
-                let pinkyPos = pinky.anchorFromJointTransform.columns.3
                 let wristPos = wrist.anchorFromJointTransform.columns.3
                 
                 func dist(_ a: simd_float4, _ b: simd_float4) -> Float {
                     return simd_distance(simd_make_float3(a.x, a.y, a.z), simd_make_float3(b.x, b.y, b.z))
                 }
                 
-                // 1. Trigger / Pinch: Thumb to Index (Valve Index Trigger)
-                if dist(thumbPos, indexPos) < 0.025 {
-                    buttons |= isRight ? (1 << 2) : (1 << 4) // ZR / ZL
-                }
+                // 1. Trigger (Index Curl) - mapped to Pinch distance
+                let pinchDist = dist(thumbPos, indexPos)
+                // Normalize pinch distance: 0.08m (open) to 0.015m (closed)
+                let triggerFloat = max(0.0, min(1.0, (0.08 - pinchDist) / (0.08 - 0.015)))
+                let triggerVal = UInt8(triggerFloat * 255.0)
                 
-                // 2. Grip / Grab: Middle, Ring, Pinky curled (Valve Index Grip)
-                if dist(middlePos, wristPos) < 0.08 && dist(ringPos, wristPos) < 0.08 {
-                    buttons |= isRight ? (1 << 5) : (1 << 7) // R / L
-                }
+                // 2. Grip (Middle/Ring Curl) - mapped to Palm distance
+                let gripDist = (dist(middlePos, wristPos) + dist(ringPos, wristPos)) / 2.0
+                // Normalize grip distance: 0.12m (open) to 0.06m (closed)
+                let gripFloat = max(0.0, min(1.0, (0.12 - gripDist) / (0.12 - 0.06)))
+                let gripVal = UInt8(gripFloat * 255.0)
                 
-                // HYBRID MODE: Physical Joy-Cons handle locomotion and face buttons (A/B/X/Y).
-                // Hand tracking is ONLY used for spatial position, Trigger, and Grip (to emulate Valve Index Knuckles).
-                
-                // Joysticks and face buttons (A/B/X/Y) are EXCLUSIVELY handled by physical Joy-Cons
-                // to prevent accidental misfires from hand tracking.
-                let stickX: Float = 0.0
-                let stickY: Float = 0.0
-                
-                return (buttons, stickX, stickY)
+                return (triggerVal, gripVal)
             }
             
             let leftInputs = getHandInputs(hand: hands.leftHand, isRight: false)
             let rightInputs = getHandInputs(hand: hands.rightHand, isRight: true)
             
-            let leftGrip = (leftInputs.buttons & (1 << 7)) != 0
-            let rightGrip = (rightInputs.buttons & (1 << 5)) != 0
-            let leftTrigger = (leftInputs.buttons & (1 << 4)) != 0
-            let rightTrigger = (rightInputs.buttons & (1 << 2)) != 0
-            
             compositor.sendPose(
                 head: headT,
                 leftHand: leftT,
                 rightHand: rightT,
-                leftPinch: leftGrip,
-                rightPinch: rightGrip,
-                leftTrigger: leftTrigger,
-                rightTrigger: rightTrigger
+                leftPinch: leftInputs.grip,
+                rightPinch: rightInputs.grip,
+                leftTrigger: leftInputs.trigger,
+                rightTrigger: rightInputs.trigger
             )
             
             DispatchQueue.main.async { [weak self] in

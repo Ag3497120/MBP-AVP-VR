@@ -58,6 +58,7 @@ struct ImmersiveView: View {
                 openWindow(id: "mainWindow")
             }
         }
+        .upperLimbVisibility(.hidden)
         .gesture(
             SpatialTapGesture()
                 .targetedToAnyEntity()
