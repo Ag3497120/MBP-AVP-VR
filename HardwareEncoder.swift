@@ -3,6 +3,7 @@ setvbuf(stdout, nil, _IONBF, 0)
 import VideoToolbox
 import CoreMedia
 import Network
+import Accelerate
 
 import simd
 
@@ -494,7 +495,7 @@ while isEncoding {
             
             if width > 0 && height > 0 {
                 if pixelBuffer == nil {
-                    CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32RGBA, nil, &pixelBuffer)
+                    CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
                 }
                 
                 if let pb = pixelBuffer {
@@ -502,13 +503,10 @@ while isEncoding {
                     let dst = CVPixelBufferGetBaseAddress(pb)!
                     let bytesPerRow = CVPixelBufferGetBytesPerRow(pb)
                     
-                    if bytesPerRow == width * 4 {
-                        memcpy(dst, pixelPtr, width * height * 4)
-                    } else {
-                        for y in 0..<height {
-                            memcpy(dst + y * bytesPerRow, pixelPtr + y * width * 4, width * 4)
-                        }
-                    }
+                    var srcBuffer = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: pixelPtr), height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: Int(width * 4))
+                    var dstBuffer = vImage_Buffer(data: dst, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: bytesPerRow)
+                    let map: [UInt8] = [2, 1, 0, 3] // Swap R (0) and B (2) -> BGRA
+                    vImagePermuteChannels_ARGB8888(&srcBuffer, &dstBuffer, map, vImage_Flags(kvImageNoFlags))
                     
                     CVPixelBufferUnlockBaseAddress(pb, [])
                     
