@@ -10,10 +10,7 @@ echo "Starting MacEncoderServer (HardwareEncoder)..."
 cd "$HOME/verantyx-cli/cli"
 ./HardwareEncoder > "$HOME/Verantyx_VR_Drive/hardware_encoder.log" 2>&1 &
 ENC_PID=$!
-echo "Starting Joy-Con Input Mapper..."
-cd "$HOME/verantyx-cli/cli"
-python3 test_joycon.py > "$HOME/Verantyx_VR_Drive/joycon.log" 2>&1 &
-JOYCON_PID=$!
+echo "Joy-Cons disabled (Full Hand Tracking active)"
 sleep 1
 
 
@@ -26,5 +23,5 @@ HLA_PID=$!
 wait $HLA_PID
 
 echo "Game exited. Cleaning up background processes..."
-kill -9 $ENC_PID $JOYCON_PID
+kill -9 $ENC_PID
 killall -9 vrserver.exe vrcompositor.exe wineserver wine64-preloader 2>/dev/null
