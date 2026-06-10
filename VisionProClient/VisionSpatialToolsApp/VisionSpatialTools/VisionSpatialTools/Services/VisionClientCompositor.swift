@@ -188,8 +188,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         assemblers[seq] = assembler
         
         if assembler.chunksReceived == assembler.expectedChunks {
-            print("[VisionClient] SUCCESS: Assembled FULL frame \(seq) with \(totalChunks) chunks!")
-            let completeFrame = assembler.frameBuffer.subdata(in: 0..<assembler.maxFrameSize)
+            // print("[VisionClient] SUCCESS: Assembled FULL frame \(seq) with \(totalChunks) chunks!")
             
             if seq > currentSeq {
                 currentSeq = seq
@@ -199,19 +198,40 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
                 lastDecodedSeq = seq - 1
             }
             
-            // ZERO-DELAY INSTANT DECODE!
-            // If a frame completes, and it's newer than the last decoded frame, decode it immediately.
-            // This ensures that a dropped UDP packet (which ruins one frame) DOES NOT freeze the entire stream!
-            // Combined with a 0.5s MaxKeyFrameInterval, visual glitches recover instantly without stutter.
-            if seq > lastDecodedSeq {
-                decoder.decodeAnnexBFrame(completeFrame, sequence: seq, timestamp: assembler.timestamp, transform: assembler.transform)
-                lastDecodedSeq = seq
+            // 1. Normal Decode: Process contiguous frames in STRICT order
+            while let readyAssembler = assemblers[lastDecodedSeq + 1], readyAssembler.chunksReceived == readyAssembler.expectedChunks {
+                let completeFrame = readyAssembler.frameBuffer.subdata(in: 0..<readyAssembler.maxFrameSize)
+                decoder.decodeAnnexBFrame(completeFrame, sequence: lastDecodedSeq + 1, timestamp: readyAssembler.timestamp, transform: readyAssembler.transform)
+                lastDecodedSeq += 1
+                assemblers.removeValue(forKey: lastDecodedSeq)
+            }
+            
+            // 2. Timeout/Skip Logic: If a packet is permanently lost, wait up to 15 frames (~166ms) before forcing a skip.
+            // This deep jitter buffer ensures that out-of-order packets due to Wi-Fi jitter do NOT corrupt the HEVC stream!
+            // Corrupting the stream causes 500ms freezes ("hitching"), so waiting 166ms is vastly superior.
+            if currentSeq >= lastDecodedSeq + 15 {
+                print("[VisionClient] LOST FRAME DETECTED! Force skipping. currentSeq=\(currentSeq), lastDecodedSeq=\(lastDecodedSeq)")
+                let sortedKeys = assemblers.keys.sorted()
+                for k in sortedKeys {
+                    if k > lastDecodedSeq {
+                        if let a = assemblers[k], a.chunksReceived == a.expectedChunks {
+                            lastDecodedSeq = k - 1
+                            break
+                        }
+                    }
+                }
+                
+                // Flush the newly found contiguous frames
+                while let readyAssembler = assemblers[lastDecodedSeq + 1], readyAssembler.chunksReceived == readyAssembler.expectedChunks {
+                    let completeFrame = readyAssembler.frameBuffer.subdata(in: 0..<readyAssembler.maxFrameSize)
+                    decoder.decodeAnnexBFrame(completeFrame, sequence: lastDecodedSeq + 1, timestamp: readyAssembler.timestamp, transform: readyAssembler.transform)
+                    lastDecodedSeq += 1
+                    assemblers.removeValue(forKey: lastDecodedSeq)
+                }
             }
             
             // Clean up old assemblers to save memory. 
-            // Increased from 10 to 30 frames to allow a deeper jitter buffer for late/out-of-order chunks!
-            assemblers.removeValue(forKey: seq)
-            let keysToRemove = assemblers.keys.filter { $0 < currentSeq && (currentSeq - $0 > 30) }
+            let keysToRemove = assemblers.keys.filter { $0 < currentSeq && (currentSeq - $0 > 60) }
             for k in keysToRemove { assemblers.removeValue(forKey: k) }
         }
     }
