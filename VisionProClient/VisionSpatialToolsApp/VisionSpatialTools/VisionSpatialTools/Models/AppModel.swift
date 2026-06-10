@@ -46,13 +46,15 @@ class AppModel: ObservableObject {
     // Metal レンダーループ（バックグラウンドスレッド）と
     // ネットワークコールバックの両方から安全にアクセスできる
     nonisolated(unsafe) private let _pixelBufferLock = NSLock()
-    nonisolated(unsafe) private var _presentationQueue: [(CVPixelBuffer, Double)] = []
     nonisolated(unsafe) private var _lastPoppedPixelBuffer: CVPixelBuffer? = nil
-    nonisolated(unsafe) private var _latestTimestamp: Double = 0.0
+    nonisolated(unsafe) private var _presentationQueue: [(CVPixelBuffer, Double, simd_float4x4)] = []
     
-    nonisolated func setLatestPixelBuffer(_ pb: CVPixelBuffer, timestamp: Double) {
+    nonisolated(unsafe) private var _latestTimestamp: Double = 0.0
+    nonisolated(unsafe) private var _latestTransform: simd_float4x4 = matrix_identity_float4x4
+    
+    nonisolated func setLatestPixelBuffer(_ pb: CVPixelBuffer, timestamp: Double, transform: simd_float4x4) {
         _pixelBufferLock.lock()
-        _presentationQueue.append((pb, timestamp))
+        _presentationQueue.append((pb, timestamp, transform))
         // Keep latency low by dropping older frames if the queue grows too large (e.g. > 3 frames)
         if _presentationQueue.count > 3 {
             _presentationQueue.removeFirst(_presentationQueue.count - 3)
@@ -67,6 +69,7 @@ class AppModel: ObservableObject {
             let popped = _presentationQueue.removeFirst()
             _lastPoppedPixelBuffer = popped.0
             _latestTimestamp = popped.1 // Update ATW timestamp ONLY when the frame is presented
+            _latestTransform = popped.2
         }
         return _lastPoppedPixelBuffer
     }
@@ -75,6 +78,12 @@ class AppModel: ObservableObject {
         _pixelBufferLock.lock()
         defer { _pixelBufferLock.unlock() }
         return _latestTimestamp
+    }
+    
+    nonisolated var latestTransform: simd_float4x4 {
+        _pixelBufferLock.lock()
+        defer { _pixelBufferLock.unlock() }
+        return _latestTransform
     }
 
     // vx-browser 移植版 ViewModel

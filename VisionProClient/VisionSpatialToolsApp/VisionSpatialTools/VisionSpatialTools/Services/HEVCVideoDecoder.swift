@@ -2,8 +2,10 @@ import Foundation
 import VideoToolbox
 import CoreMedia
 
+import simd
+
 protocol HEVCVideoDecoderDelegate: AnyObject {
-    func didDecodeFrame(_ pixelBuffer: CVPixelBuffer, timestamp: Double)
+    func didDecodeFrame(_ pixelBuffer: CVPixelBuffer, timestamp: Double, transform: simd_float4x4)
 }
 
 class HEVCVideoDecoder {
@@ -18,11 +20,11 @@ class HEVCVideoDecoder {
     private var pps: Data?
     
     private var isH264 = false
-    var decodeTimestampQueue = [UInt32: Double]()
+    var decodeTimestampQueue = [UInt32: (Double, simd_float4x4)]()
     
     // Parses Annex B stream (0x00 0x00 0x00 0x01) and feeds it to VideoToolbox
-    func decodeAnnexBFrame(_ frameData: Data, sequence: UInt32, timestamp: Double) {
-        self.decodeTimestampQueue[sequence] = timestamp
+    func decodeAnnexBFrame(_ frameData: Data, sequence: UInt32, timestamp: Double, transform: simd_float4x4) {
+        self.decodeTimestampQueue[sequence] = (timestamp, transform)
         
         let nals = extractNALUnits(from: frameData)
         var vclNals = [Data]()
@@ -290,8 +292,8 @@ func decompressionSessionCallback(
     let decoder = Unmanaged<HEVCVideoDecoder>.fromOpaque(decompressionOutputRefCon!).takeUnretainedValue()
     
     let seq = UInt32(UInt(bitPattern: sourceFrameRefCon))
-    let ts = decoder.decodeTimestampQueue[seq] ?? 0.0
+    let payload = decoder.decodeTimestampQueue[seq] ?? (0.0, matrix_identity_float4x4)
     decoder.decodeTimestampQueue.removeValue(forKey: seq)
     
-    decoder.delegate?.didDecodeFrame(pixelBuffer, timestamp: ts)
+    decoder.delegate?.didDecodeFrame(pixelBuffer, timestamp: payload.0, transform: payload.1)
 }

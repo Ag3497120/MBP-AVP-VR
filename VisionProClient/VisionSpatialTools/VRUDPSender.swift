@@ -2,6 +2,7 @@ import Foundation
 import Network
 import simd
 import Combine
+import QuartzCore
 
 struct VRPosePacket {
     var magic: UInt32 = 0x504F5345 // "POSE"
@@ -50,7 +51,8 @@ class VRUDPSender: ObservableObject {
                   leftPinch: Bool, rightPinch: Bool,
                   leftButtons: UInt32 = 0, rightButtons: UInt32 = 0,
                   leftStickX: Float = 0.0, leftStickY: Float = 0.0,
-                  rightStickX: Float = 0.0, rightStickY: Float = 0.0) {
+                  rightStickX: Float = 0.0, rightStickY: Float = 0.0,
+                  gazeX: Float = 0.5, gazeY: Float = 0.5) {
         guard let connection = connection, connection.state == .ready else { return }
         
         var packetData = Data()
@@ -100,6 +102,11 @@ class VRUDPSender: ObservableObject {
         packetData.append(Data(bytes: &rsY, count: 4))
         packetData.append(Data(bytes: &lsX, count: 4))
         packetData.append(Data(bytes: &lsY, count: 4))
+        
+        var gx = gazeX
+        var gy = gazeY
+        packetData.append(Data(bytes: &gx, count: 4))
+        packetData.append(Data(bytes: &gy, count: 4))
         
         connection.send(content: packetData, completion: .contentProcessed { error in
             if let error = error {

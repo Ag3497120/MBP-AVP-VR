@@ -27,6 +27,16 @@ struct SharedFrame {
     uint32_t width;
     uint32_t height;
     uint32_t format;
+    float renderHeadTransform[16];
+    double visionTimestamp;
+};
+
+const int MAX_PIXEL_DATA_SIZE = 4096 * 4096 * 4;
+const int FRAME_BLOCK_SIZE = sizeof(SharedFrame) + MAX_PIXEL_DATA_SIZE;
+
+struct DoubleBufferHeader {
+    uint32_t latestReadyIndex;
+    uint32_t padding[15];
 };
 
 #pragma pack(push, 1)
@@ -46,13 +56,15 @@ struct SharedHands {
     float leftStickY;
     float rightVelocity[3];
     float leftVelocity[3];
+    double visionTimestamp;
 };
 #pragma pack(pop)
 
 static HANDLE hMapFile = NULL;
 static void* pBuf = NULL;
-static SharedFrame* pHeader = NULL;
-static uint8_t* pPixelData = NULL;
+static DoubleBufferHeader* pDbHeader = NULL;
+static SharedFrame* pHeaders[2] = {NULL, NULL};
+static uint8_t* pPixelDatas[2] = {NULL, NULL};
 static SharedHands* pSharedHands = NULL;
 static uint32_t frameSeq = 1;
 static ID3D11Texture2D* pStagingTexture = NULL;
@@ -66,6 +78,158 @@ static float g_lastLeftVel[3] = {0,0,0};
 static float g_lastRightVel[3] = {0,0,0};
 static float g_lastLeftAngularVel[3] = {0,0,0};
 static float g_lastRightAngularVel[3] = {0,0,0};
+
+static float g_lastHeadTransform[16] = {0};
+static float g_lastHeadVel[3] = {0,0,0};
+static float g_lastHeadAngularVel[3] = {0,0,0};
+static double g_lastHeadVisionTimestamp = 0.0;
+static auto g_lastHeadArrivalMacTime = std::chrono::high_resolution_clock::now();
+
+static double g_renderedVisionTimestamp = 0.0;
+static float g_renderedHeadTransform[16] = {0};
+
+void ApplyHeadExtrapolation(vr::TrackedDevicePose_t* pose, float* targetTransform, double visionTimestamp, float fPredictedSecondsToPhotonsFromNow) {
+    // ALWAYS capture the exact timestamp and transform being used for this pose query.
+    // The engine may query the pose right before rendering (bypassing WaitGetPoses timing).
+    g_renderedVisionTimestamp = visionTimestamp;
+    
+    // Disable prediction to eliminate double-transformation!
+    // VisionOS physically places the deviceAnchor at the specified timestamp in 3D space.
+    // If we extrapolate the pose in SteamVR, the virtual camera moves AND the VisionOS anchor moves,
+    // resulting in 2x the movement (violent vertical and horizontal shaking).
+    float total_extrapolate = 0.0f;
+    
+    for(int r=0; r<3; r++) {
+        for(int c=0; c<4; c++) {
+            g_renderedHeadTransform[c*4+r] = targetTransform[c*4+r];
+        }
+    }
+    
+    auto now = std::chrono::high_resolution_clock::now();
+    
+    // Initialize on first frame
+    if (g_lastHeadTransform[0] == 0.0f && g_lastHeadTransform[5] == 0.0f) {
+        for(int i=0; i<16; i++) g_lastHeadTransform[i] = targetTransform[i];
+        g_lastHeadVisionTimestamp = visionTimestamp;
+        g_lastHeadArrivalMacTime = now;
+    }
+    
+    // New UDP packet arrived
+    if (visionTimestamp > g_lastHeadVisionTimestamp) {
+        float dt = (float)(visionTimestamp - g_lastHeadVisionTimestamp);
+        if (dt < 0.001f) dt = 0.001f;
+        if (dt > 0.1f) dt = 0.1f; // Cap dt to avoid huge spikes
+        
+        // Calculate Velocity
+        float rawVel[3];
+        rawVel[0] = (targetTransform[12] - g_lastHeadTransform[12]) / dt;
+        rawVel[1] = (targetTransform[13] - g_lastHeadTransform[13]) / dt;
+        rawVel[2] = (targetTransform[14] - g_lastHeadTransform[14]) / dt;
+        
+        float velSmooth = 10.0f * dt;
+        if (velSmooth > 1.0f) velSmooth = 1.0f;
+        g_lastHeadVel[0] += (rawVel[0] - g_lastHeadVel[0]) * velSmooth;
+        g_lastHeadVel[1] += (rawVel[1] - g_lastHeadVel[1]) * velSmooth;
+        g_lastHeadVel[2] += (rawVel[2] - g_lastHeadVel[2]) * velSmooth;
+        
+        // Calculate Angular Velocity
+        float R_prev[3][3];
+        float R_cur[3][3];
+        for(int r=0; r<3; r++) {
+            for(int c=0; c<3; c++) {
+                R_prev[r][c] = g_lastHeadTransform[c*4 + r];
+                R_cur[r][c] = targetTransform[c*4 + r];
+            }
+        }
+        
+        float R_delta[3][3];
+        for(int r=0; r<3; r++) {
+            for(int c=0; c<3; c++) {
+                R_delta[r][c] = 0;
+                for(int k=0; k<3; k++) {
+                    R_delta[r][c] += R_cur[r][k] * R_prev[c][k];
+                }
+            }
+        }
+        
+        float rawOmegaX = (R_delta[2][1] - R_delta[1][2]) / (2.0f * dt);
+        float rawOmegaY = (R_delta[0][2] - R_delta[2][0]) / (2.0f * dt);
+        float rawOmegaZ = (R_delta[1][0] - R_delta[0][1]) / (2.0f * dt);
+        
+        if (fabs(rawOmegaX) > 50.0f) rawOmegaX = 0;
+        if (fabs(rawOmegaY) > 50.0f) rawOmegaY = 0;
+        if (fabs(rawOmegaZ) > 50.0f) rawOmegaZ = 0;
+        
+        float angSmooth = 15.0f * dt;
+        if (angSmooth > 1.0f) angSmooth = 1.0f;
+        g_lastHeadAngularVel[0] += (rawOmegaX - g_lastHeadAngularVel[0]) * angSmooth;
+        g_lastHeadAngularVel[1] += (rawOmegaY - g_lastHeadAngularVel[1]) * angSmooth;
+        g_lastHeadAngularVel[2] += (rawOmegaZ - g_lastHeadAngularVel[2]) * angSmooth;
+        
+        for(int i=0; i<16; i++) g_lastHeadTransform[i] = targetTransform[i];
+        g_lastHeadVisionTimestamp = visionTimestamp;
+        g_lastHeadArrivalMacTime = now;
+    }
+    
+    pose->bPoseIsValid = true;
+    pose->bDeviceIsConnected = true;
+    pose->eTrackingResult = vr::TrackingResult_Running_OK;
+    
+    // Copy base transform
+    for(int r=0; r<3; r++) {
+        for(int c=0; c<4; c++) {
+            pose->mDeviceToAbsoluteTracking.m[r][c] = targetTransform[c*4 + r];
+        }
+    }
+    
+    // Extrapolate Position
+    pose->mDeviceToAbsoluteTracking.m[0][3] += g_lastHeadVel[0] * total_extrapolate;
+    pose->mDeviceToAbsoluteTracking.m[1][3] += g_lastHeadVel[1] * total_extrapolate;
+    pose->mDeviceToAbsoluteTracking.m[2][3] += g_lastHeadVel[2] * total_extrapolate;
+    
+    // Extrapolate Rotation (Small Angle Approximation)
+    float wx = g_lastHeadAngularVel[0] * total_extrapolate;
+    float wy = g_lastHeadAngularVel[1] * total_extrapolate;
+    float wz = g_lastHeadAngularVel[2] * total_extrapolate;
+    
+    float R_delta_extrapolate[3][3] = {
+        { 1.0f, -wz, wy },
+        { wz, 1.0f, -wx },
+        { -wy, wx, 1.0f }
+    };
+    
+    float currentR[3][3];
+    for(int r=0; r<3; r++) {
+        for(int c=0; c<3; c++) {
+            currentR[r][c] = pose->mDeviceToAbsoluteTracking.m[r][c];
+        }
+    }
+    
+    for(int r=0; r<3; r++) {
+        for(int c=0; c<3; c++) {
+            pose->mDeviceToAbsoluteTracking.m[r][c] = 0;
+            for(int k=0; k<3; k++) {
+                pose->mDeviceToAbsoluteTracking.m[r][c] += R_delta_extrapolate[r][k] * currentR[k][c];
+            }
+        }
+    }
+    
+    // Re-normalize rotation matrix to prevent distortion
+    float col0_mag = sqrt(pose->mDeviceToAbsoluteTracking.m[0][0]*pose->mDeviceToAbsoluteTracking.m[0][0] + pose->mDeviceToAbsoluteTracking.m[1][0]*pose->mDeviceToAbsoluteTracking.m[1][0] + pose->mDeviceToAbsoluteTracking.m[2][0]*pose->mDeviceToAbsoluteTracking.m[2][0]);
+    float col1_mag = sqrt(pose->mDeviceToAbsoluteTracking.m[0][1]*pose->mDeviceToAbsoluteTracking.m[0][1] + pose->mDeviceToAbsoluteTracking.m[1][1]*pose->mDeviceToAbsoluteTracking.m[1][1] + pose->mDeviceToAbsoluteTracking.m[2][1]*pose->mDeviceToAbsoluteTracking.m[2][1]);
+    float col2_mag = sqrt(pose->mDeviceToAbsoluteTracking.m[0][2]*pose->mDeviceToAbsoluteTracking.m[0][2] + pose->mDeviceToAbsoluteTracking.m[1][2]*pose->mDeviceToAbsoluteTracking.m[1][2] + pose->mDeviceToAbsoluteTracking.m[2][2]*pose->mDeviceToAbsoluteTracking.m[2][2]);
+    
+    if (col0_mag > 0) { pose->mDeviceToAbsoluteTracking.m[0][0]/=col0_mag; pose->mDeviceToAbsoluteTracking.m[1][0]/=col0_mag; pose->mDeviceToAbsoluteTracking.m[2][0]/=col0_mag; }
+    if (col1_mag > 0) { pose->mDeviceToAbsoluteTracking.m[0][1]/=col1_mag; pose->mDeviceToAbsoluteTracking.m[1][1]/=col1_mag; pose->mDeviceToAbsoluteTracking.m[2][1]/=col1_mag; }
+    if (col2_mag > 0) { pose->mDeviceToAbsoluteTracking.m[0][2]/=col2_mag; pose->mDeviceToAbsoluteTracking.m[1][2]/=col2_mag; pose->mDeviceToAbsoluteTracking.m[2][2]/=col2_mag; }
+    
+    pose->vVelocity.v[0] = 0.0f;
+    pose->vVelocity.v[1] = 0.0f;
+    pose->vVelocity.v[2] = 0.0f;
+    pose->vAngularVelocity.v[0] = 0.0f;
+    pose->vAngularVelocity.v[1] = 0.0f;
+    pose->vAngularVelocity.v[2] = 0.0f;
+}
 
 void ApplySmoothPose(vr::TrackedDevicePose_t* pose, float* targetTransform, float* lastTransform, float* lastVel, float* lastAngularVel, float fPredictedSecondsToPhotonsFromNow, float dt) {
     if (lastTransform[0] == 0.0f && lastTransform[5] == 0.0f && lastTransform[10] == 0.0f) {
@@ -173,7 +337,7 @@ void ApplySmoothPose(vr::TrackedDevicePose_t* pose, float* targetTransform, floa
 static void InitSharedMemory() {
     if (hMapFile) return;
     
-    const int mapSize = 16 + 4096 * 4096 * 4 + 194;
+    const int mapSize = sizeof(DoubleBufferHeader) + (FRAME_BLOCK_SIZE * 2) + sizeof(SharedHands) + 1024;
     
     HANDLE hFile = CreateFileA("C:\\vr_shared_frame.dat", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
@@ -188,10 +352,17 @@ static void InitSharedMemory() {
         if (hMapFile) {
             pBuf = MapViewOfFile(hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, mapSize);
             if (pBuf) {
-                pHeader = (SharedFrame*)pBuf;
-                pPixelData = (uint8_t*)pBuf + sizeof(SharedFrame);
-                pSharedHands = (SharedHands*)((uint8_t*)pBuf + 16 + 4096 * 4096 * 4);
-                memset(pSharedHands, 0, sizeof(SharedHands));
+                pDbHeader = (DoubleBufferHeader*)pBuf;
+                // Double buffering: two blocks of FRAME_BLOCK_SIZE
+                uint8_t* base = (uint8_t*)pBuf + sizeof(DoubleBufferHeader);
+                
+                pHeaders[0] = (SharedFrame*)base;
+                pPixelDatas[0] = base + sizeof(SharedFrame);
+                
+                pHeaders[1] = (SharedFrame*)(base + FRAME_BLOCK_SIZE);
+                pPixelDatas[1] = base + FRAME_BLOCK_SIZE + sizeof(SharedFrame);
+                
+                pSharedHands = (SharedHands*)(base + (FRAME_BLOCK_SIZE * 2));
             }
         }
     }
@@ -310,8 +481,8 @@ class Mock_IVRSystem : public vr::IVRSystem {
 public:
     virtual void GetRecommendedRenderTargetSize(uint32_t *pnWidth, uint32_t *pnHeight) override {
         LogMsg("Called: IVRSystem::GetRecommendedRenderTargetSize\n");
-        if(pnWidth) *pnWidth = 1920;
-        if(pnHeight) *pnHeight = 2160;
+        if(pnWidth) *pnWidth = 1440;
+        if(pnHeight) *pnHeight = 1620;
     }
     virtual void GetProjectionMatrix(vr::HmdMatrix44_t *pRet, vr::EVREye eEye, float fNearZ, float fFarZ) override {
         if (pRet) {
@@ -394,11 +565,27 @@ public:
                 pTrackedDevicePoseArray[i].eTrackingResult = vr::TrackingResult_Running_OK; 
                 
                 if (i == 0 && pSharedHands && pSharedHands->headTransform[0] != 0.0f) {
-                    for(int r=0;r<3;r++) for(int c=0;c<4;c++) pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->headTransform[c*4 + r];
-                } else if (i == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
-                    ApplySmoothPose(&pTrackedDevicePoseArray[i], pSharedHands->leftTransform, g_lastLeftTransform, g_lastLeftVel, g_lastLeftAngularVel, fPredictedSecondsToPhotonsFromNow, dt);
-                } else if (i == 2) {
-                    ApplySmoothPose(&pTrackedDevicePoseArray[i], pSharedHands->rightTransform, g_lastRightTransform, g_lastRightVel, g_lastRightAngularVel, fPredictedSecondsToPhotonsFromNow, dt);
+                    ApplyHeadExtrapolation(&pTrackedDevicePoseArray[i], pSharedHands->headTransform, pSharedHands->visionTimestamp, fPredictedSecondsToPhotonsFromNow);
+                } else if (i == 1 || i == 2) {
+                    float* srcTransform = nullptr;
+                    if (i == 1) srcTransform = pSharedHands ? pSharedHands->leftTransform : nullptr;
+                    if (i == 2) srcTransform = pSharedHands ? pSharedHands->rightTransform : nullptr;
+                    
+                    if (srcTransform && srcTransform[0] != 0.0f) {
+                        if (i == 1) ApplySmoothPose(&pTrackedDevicePoseArray[i], srcTransform, g_lastLeftTransform, g_lastLeftVel, g_lastLeftAngularVel, fPredictedSecondsToPhotonsFromNow, dt);
+                        if (i == 2) ApplySmoothPose(&pTrackedDevicePoseArray[i], srcTransform, g_lastRightTransform, g_lastRightVel, g_lastRightAngularVel, fPredictedSecondsToPhotonsFromNow, dt);
+                    } else if (pTrackedDevicePoseArray[0].bPoseIsValid) {
+                        // Fallback to head tracking
+                        pTrackedDevicePoseArray[i] = pTrackedDevicePoseArray[0];
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] -= 0.3f;
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[2][3] -= 0.5f;
+                        if (i == 1) pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] -= 0.2f;
+                        if (i == 2) pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] += 0.2f;
+                    } else {
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1; 
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1; 
+                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1; 
+                    }
                 } else {
                     pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1; 
                     pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1; 
@@ -1547,18 +1734,13 @@ public:
                     }
                     
                     if (srcTransform && srcTransform[15] != 0.0f) {
-                        static bool printedMatrix = false;
-                        if (!printedMatrix) {
-                            printedMatrix = true;
-                            FILE* f = fopen("vr_emulator_log.txt", "a");
-                            if (f) {
-                                fprintf(f, "HEAD TRANSFORM: ");
-                                for(int k=0; k<16; k++) fprintf(f, "%f ", srcTransform[k]);
-                                fprintf(f, "\n");
-                                fclose(f);
-                            }
+                        if (i == 0) {
+                            // Apply head extrapolation
+                            ApplyHeadExtrapolation(&pRenderPoseArray[i], srcTransform, pSharedHands->visionTimestamp, 0.0f);
+                        } else {
+                            for(int r=0;r<3;r++) for(int c=0;c<4;c++) pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = srcTransform[c*4 + r];
                         }
-                        for(int r=0;r<3;r++) for(int c=0;c<4;c++) pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = srcTransform[c*4 + r];
+                        
                         if (i > 0 && srcTransform == pSharedHands->headTransform) {
                             // Offset controller slightly from head so laser isn't in eyes
                             pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][3] += (i == 1) ? -0.2f : 0.2f;
@@ -1740,10 +1922,18 @@ public:
                                     uint32_t srcX = (uint32_t)(desc.Width * uMin);
                                     uint32_t srcY = (uint32_t)(desc.Height * vMin);
                                     
+                                    uint32_t writeIndex = (frameSeq + 1) % 2;
+                                    SharedFrame* pHeader = pHeaders[writeIndex];
+                                    uint8_t* pPixelData = pPixelDatas[writeIndex];
+                                    
                                     if (pHeader && pPixelData) {
                                         pHeader->width = srcWidth * 2;
                                         pHeader->height = srcHeight;
                                         pHeader->format = desc.Format;
+                                        if (pSharedHands) {
+                                            pHeader->visionTimestamp = g_renderedVisionTimestamp;
+                                            for(int i=0; i<16; i++) pHeader->renderHeadTransform[i] = g_renderedHeadTransform[i];
+                                        }
                                     }
                                     
                                     uint32_t copyWidth = (srcWidth > 4096) ? 4096 : srcWidth;
@@ -1752,19 +1942,22 @@ public:
                                     uint8_t* dst = pPixelData;
                                     uint8_t* src = ((uint8_t*)mapped.pData) + srcY * mapped.RowPitch + srcX * 4;
                                     
-                                    if (eEye == vr::Eye_Left) {
-                                        for(uint32_t y=0; y<copyHeight; ++y) {
-                                            memcpy(dst + y * (copyWidth * 2) * 4, src + y * mapped.RowPitch, copyWidth * 4);
-                                        }
-                                    } else {
-                                        // Right eye mapped next to it
-                                        for(uint32_t y=0; y<copyHeight; ++y) {
-                                            memcpy(dst + y * (copyWidth * 2) * 4 + copyWidth * 4, src + y * mapped.RowPitch, copyWidth * 4);
+                                    if (dst && src) {
+                                        if (eEye == vr::Eye_Left) {
+                                            for(uint32_t y=0; y<copyHeight; ++y) {
+                                                memcpy(dst + y * (copyWidth * 2) * 4, src + y * mapped.RowPitch, copyWidth * 4);
+                                            }
+                                        } else {
+                                            // Right eye mapped next to it
+                                            for(uint32_t y=0; y<copyHeight; ++y) {
+                                                memcpy(dst + y * (copyWidth * 2) * 4 + copyWidth * 4, src + y * mapped.RowPitch, copyWidth * 4);
+                                            }
                                         }
                                     }
                                     
                                     if (eEye == vr::Eye_Right) {
-                                        pHeader->sequenceNumber = ++frameSeq;
+                                        if (pHeader) pHeader->sequenceNumber = ++frameSeq;
+                                        if (pDbHeader) pDbHeader->latestReadyIndex = writeIndex;
                                     }
                                     pContext->Unmap(pStagingTexture, 0);
                                 }

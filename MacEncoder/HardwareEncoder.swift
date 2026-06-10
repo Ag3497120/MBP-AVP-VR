@@ -14,8 +14,20 @@ struct SharedFrame {
     var width: UInt32
     var height: UInt32
     var format: UInt32
+    var renderHeadTransform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
+    var visionTimestamp: Double
 }
 
+struct DoubleBufferHeader {
+    var latestReadyIndex: UInt32
+    var padding: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32)
+}
+
+struct FrameContext {
+    var sequence: UInt32
+    var visionTimestamp: Double
+    var transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
+}
 struct UDPHeader {
     var magic: UInt32 // 0x5652414E ("VRAN")
     var frameSequence: UInt32
@@ -24,6 +36,7 @@ struct UDPHeader {
     var chunkOffset: UInt32
     var payloadSize: UInt32
     var timestamp: Double
+    var transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
 }
 
 public struct JCrossNode_VR {
@@ -85,7 +98,7 @@ var cachedVPS: Data?
 var cachedSPS: Data?
 var cachedPPS: Data?
 
-func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSequence: UInt32) {
+func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSequence: UInt32, visionTimestamp: Double, transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)) {
     guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
     var length = 0
     var dataPointer: UnsafeMutablePointer<Int8>? = nil
@@ -119,19 +132,20 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
         }
     }
     
-    // Prepend to EVERY frame so the Vision Pro can always decode instantly even if a keyframe is dropped
-    let startCode: [UInt8] = [0, 0, 0, 1]
-    if let vps = cachedVPS {
-        frameData.append(contentsOf: startCode)
-        frameData.append(vps)
-    }
-    if let sps = cachedSPS {
-        frameData.append(contentsOf: startCode)
-        frameData.append(sps)
-    }
-    if let pps = cachedPPS {
-        frameData.append(contentsOf: startCode)
-        frameData.append(pps)
+    if isKeyFrame {
+        let startCode: [UInt8] = [0, 0, 0, 1]
+        if let vps = cachedVPS {
+            frameData.append(contentsOf: startCode)
+            frameData.append(vps)
+        }
+        if let sps = cachedSPS {
+            frameData.append(contentsOf: startCode)
+            frameData.append(sps)
+        }
+        if let pps = cachedPPS {
+            frameData.append(contentsOf: startCode)
+            frameData.append(pps)
+        }
     }
     
     // 2. AVCC to Annex-B Conversion
@@ -149,7 +163,7 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
     }
     
     // 3. UDP Fragmentation and Transmission
-    let mtu = 1400
+    let mtu = 1300 // Reduced from 1400 to prevent MTU fragmentation (1300 + 96 header + 28 IP/UDP <= 1500 MTU)
     let totalBytes = frameData.count
     let numFragments = (totalBytes + mtu - 1) / mtu
     
@@ -160,9 +174,6 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
             let chunkOffset = i * mtu
             let fragSize = min(mtu, totalBytes - chunkOffset)
             
-            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            let timestamp = CMTimeGetSeconds(pts)
-            
             var header = UDPHeader(
                 magic: UInt32(0x5652414E).littleEndian, // "VRAN"
                 frameSequence: frameSequence.littleEndian,
@@ -170,7 +181,8 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
                 totalChunks: UInt32(numFragments).littleEndian,
                 chunkOffset: UInt32(chunkOffset).littleEndian,
                 payloadSize: UInt32(fragSize).littleEndian,
-                timestamp: timestamp
+                timestamp: visionTimestamp,
+                transform: transform
             )
             
             var packet = Data()
@@ -187,8 +199,9 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
                 }
             }
             
-            // Smart Pacing disabled for Direct AP connection (Internet Sharing) to minimize latency
-            // if i % 20 == 19 { usleep(1000) }
+            // Smart Pacing: Avoid overwhelming AWDL buffer with sudden UDP bursts.
+            // 200 packets per frame is common; pacing every 10 packets with 500us rest allows smooth draining.
+            if i % 15 == 14 { usleep(500) }
         }
     }
 }
@@ -238,9 +251,13 @@ func setupEncoder(width: Int32, height: Int32) {
                                             compressedDataAllocator: nil,
                                             outputCallback: { (outputCallbackRefCon, sourceFrameRefCon, status, infoFlags, sampleBuffer) in
         var frameSequence: UInt32 = 0
+        var visionTimestamp: Double = 0.0
+        var transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float) = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
         if let sourceFrameRefCon = sourceFrameRefCon {
-            let refConPtr = sourceFrameRefCon.assumingMemoryBound(to: UInt32.self)
-            frameSequence = refConPtr.pointee
+            let refConPtr = sourceFrameRefCon.assumingMemoryBound(to: FrameContext.self)
+            frameSequence = refConPtr.pointee.sequence
+            visionTimestamp = refConPtr.pointee.visionTimestamp
+            transform = refConPtr.pointee.transform
             refConPtr.deinitialize(count: 1)
             refConPtr.deallocate()
         }
@@ -252,7 +269,7 @@ func setupEncoder(width: Int32, height: Int32) {
         guard let sampleBuffer = sampleBuffer else { return }
         let isKeyFrame = !infoFlags.contains(.frameDropped) && (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]] == nil || (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]])?.first?[kCMSampleAttachmentKey_NotSync] == nil)
         
-        processSampleBuffer(sampleBuffer: sampleBuffer, isKeyFrame: isKeyFrame, frameSequence: frameSequence)
+        processSampleBuffer(sampleBuffer: sampleBuffer, isKeyFrame: isKeyFrame, frameSequence: frameSequence, visionTimestamp: visionTimestamp, transform: transform)
         
     },
                                             refcon: nil,
@@ -270,7 +287,7 @@ func setupEncoder(width: Int32, height: Int32) {
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse) // Disable B-frames
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
     
-    var bitrate: Int32 = 150_000_000 // Bump to 150 Mbps for ultra-high quality direct AP streaming
+    var bitrate: Int32 = 100_000_000 // Sweet spot for ultra-smooth AWDL streaming at lower resolution
     let bitrateNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &bitrate)
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateNum)
     
@@ -288,7 +305,7 @@ func setupEncoder(width: Int32, height: Int32) {
 // MARK: - Main IPC Loop
 
 let filePath = NSHomeDirectory() + "/Verantyx_VR_Drive/SteamVR_Prefix/drive_c/vr_shared_frame.dat"
-let mapSize = 16 + 4096 * 4096 * 4 + 1024
+let mapSize = MemoryLayout<DoubleBufferHeader>.size + (Int(MemoryLayout<SharedFrame>.size) + 4096 * 4096 * 4) * 2 + 264 + 1024
 
 print("Waiting for vr_shared_frame.dat...")
 while true {
@@ -296,7 +313,7 @@ while true {
         do {
             let attr = try FileManager.default.attributesOfItem(atPath: filePath)
             if let fileSize = attr[FileAttributeKey.size] as? UInt64 {
-                if fileSize >= mapSize {
+                if fileSize >= 134217000 { // Allow for struct padding differences between Swift and MinGW
                     break
                 }
             }
@@ -317,9 +334,21 @@ if mapPtr == MAP_FAILED {
     exit(1)
 }
 
-let headerPtr = mapPtr!.bindMemory(to: SharedFrame.self, capacity: 1)
-let pixelPtr = mapPtr! + MemoryLayout<SharedFrame>.size
-let handsMapPtr = mapPtr! + 16 + 4096 * 4096 * 4
+let basePtr = mapPtr! + MemoryLayout<DoubleBufferHeader>.size
+let frameBlockSize = Int(MemoryLayout<SharedFrame>.size) + 4096 * 4096 * 4
+
+let headers: [UnsafeMutablePointer<SharedFrame>] = [
+    basePtr.bindMemory(to: SharedFrame.self, capacity: 1),
+    (basePtr + frameBlockSize).bindMemory(to: SharedFrame.self, capacity: 1)
+]
+
+let pixelDatas: [UnsafeMutableRawPointer] = [
+    basePtr + MemoryLayout<SharedFrame>.size,
+    (basePtr + frameBlockSize) + MemoryLayout<SharedFrame>.size
+]
+
+let handsMapPtr = basePtr + (frameBlockSize * 2)
+let dbHeaderPtr = mapPtr!.bindMemory(to: DoubleBufferHeader.self, capacity: 1)
 
 var lastSeq: UInt32 = 0
 var pixelBuffer: CVPixelBuffer?
@@ -420,6 +449,8 @@ DispatchQueue.global(qos: .userInteractive).async {
                 memcpy(&magic, baseAddr, 4)
 
                 if magic == 0x45534F50 || magic == 0x504F5345 { // "POSE"
+                    let visionTs = baseAddr.load(fromByteOffset: 8, as: Double.self)
+                    
                     // Vision Pro payload: magic(4) + pad(4) + ts(8) = 16 bytes offset
                     memcpy(handsMapPtr, baseAddr + 16, 64)       // Head (offset 0)
                     memcpy(handsMapPtr + 64, baseAddr + 80, 64)  // Left (offset 64)
@@ -434,6 +465,7 @@ DispatchQueue.global(qos: .userInteractive).async {
                     handsMapPtr.advanced(by: 193).storeBytes(of: visionRightPinch, as: UInt8.self)
                     handsMapPtr.advanced(by: 194).storeBytes(of: visionLeftTrigger, as: UInt8.self)
                     handsMapPtr.advanced(by: 195).storeBytes(of: visionRightTrigger, as: UInt8.self)
+                    handsMapPtr.advanced(by: 244).storeBytes(of: visionTs, as: Double.self)
                     
                     if bytesRead >= 236 {
                         let rightButtons = baseAddr.load(fromByteOffset: 212, as: UInt32.self)
@@ -485,73 +517,89 @@ print("Published Bonjour _verantyxvr._udp. Waiting for Vision Pro connection (AW
 
 print("Starting native read loop and UDP transmission on port 9999...")
 
+var lastReadIndex: UInt32 = 0xFFFFFFFF
+
 while isEncoding {
     autoreleasepool {
-        let currentSeq = headerPtr.pointee.sequenceNumber
-        if currentSeq != lastSeq && currentSeq > 0 {
-            let width = Int(headerPtr.pointee.width)
-            let height = Int(headerPtr.pointee.height)
+        let readyIndex = dbHeaderPtr.pointee.latestReadyIndex
+        if readyIndex != lastReadIndex && readyIndex < 2 {
+            let headerPtr = headers[Int(readyIndex)]
+            let currentSeq = headerPtr.pointee.sequenceNumber
             
-            if width != currentWidth || height != currentHeight {
-                if compressionSession != nil {
-                    VTCompressionSessionInvalidate(compressionSession!)
-                    compressionSession = nil
-                }
-                pixelBuffer = nil
-                currentWidth = width
-                currentHeight = height
-                print("Resolution changed to \(width)x\(height)")
-            }
-            
-            if compressionSession == nil && width > 0 && height > 0 {
-                print("Initializing VideoToolbox encoder for \(width)x\(height)...")
-                fflush(stdout)
-                setupEncoder(width: Int32(width), height: Int32(height))
-            }
-            
-            if width > 0 && height > 0 {
-                if pixelBuffer == nil {
-                    CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
+            if currentSeq != lastSeq && currentSeq > 0 {
+                let width = Int(headerPtr.pointee.width)
+                let height = Int(headerPtr.pointee.height)
+                
+                if width != currentWidth || height != currentHeight {
+                    if compressionSession != nil {
+                        VTCompressionSessionInvalidate(compressionSession!)
+                        compressionSession = nil
+                    }
+                    pixelBuffer = nil
+                    currentWidth = width
+                    currentHeight = height
+                    print("Resolution changed to \(width)x\(height)")
                 }
                 
-                if let pb = pixelBuffer {
-                    CVPixelBufferLockBaseAddress(pb, [])
-                    let dst = CVPixelBufferGetBaseAddress(pb)!
-                    let bytesPerRow = CVPixelBufferGetBytesPerRow(pb)
-                    
-                    var srcBuffer = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: pixelPtr), height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: Int(width * 4))
-                    var dstBuffer = vImage_Buffer(data: dst, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: bytesPerRow)
-                    let map: [UInt8] = [2, 1, 0, 3] // Swap R (0) and B (2) -> BGRA
-                    vImagePermuteChannels_ARGB8888(&srcBuffer, &dstBuffer, map, vImage_Flags(kvImageNoFlags))
-                    
-                    CVPixelBufferUnlockBaseAddress(pb, [])
-                    
-                    let presentationTime = CMTime(value: CMTimeValue(framesEncoded), timescale: 90)
-                    currentFrameSequence = currentSeq
-                    
-                    let refConPtr = UnsafeMutablePointer<UInt32>.allocate(capacity: 1)
-                    refConPtr.initialize(to: currentSeq)
-                    
-                    let status = VTCompressionSessionEncodeFrame(compressionSession!,
-                                                                 imageBuffer: pb,
-                                                                 presentationTimeStamp: presentationTime,
-                                                                 duration: CMTime.invalid,
-                                                                 frameProperties: nil,
-                                                                 sourceFrameRefcon: UnsafeMutableRawPointer(refConPtr),
-                                                                 infoFlagsOut: nil)
-                    
-                    if status != noErr {
-                        print("VTCompressionSessionEncodeFrame failed: \(status)")
-                        refConPtr.deinitialize(count: 1)
-                        refConPtr.deallocate()
+                if compressionSession == nil && width > 0 && height > 0 {
+                    print("Initializing VideoToolbox encoder for \(width)x\(height)...")
+                    fflush(stdout)
+                    setupEncoder(width: Int32(width), height: Int32(height))
+                }
+                
+                if width > 0 && height > 0 {
+                    if pixelBuffer == nil {
+                        CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
                     }
                     
-                    framesEncoded += 1
+                    if let pb = pixelBuffer {
+                        CVPixelBufferLockBaseAddress(pb, [])
+                        let dst = CVPixelBufferGetBaseAddress(pb)!
+                        let bytesPerRow = CVPixelBufferGetBytesPerRow(pb)
+                        
+                        let pixelPtr = pixelDatas[Int(readyIndex)]
+                        var srcBuffer = vImage_Buffer(data: pixelPtr, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: Int(width * 4))
+                        var dstBuffer = vImage_Buffer(data: dst, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: bytesPerRow)
+                        let map: [UInt8] = [2, 1, 0, 3] // Swap R (0) and B (2) -> BGRA
+                        vImagePermuteChannels_ARGB8888(&srcBuffer, &dstBuffer, map, vImage_Flags(kvImageNoFlags))
+                        
+                        CVPixelBufferUnlockBaseAddress(pb, [])
+                        
+                        let presentationTime = CMTime(value: CMTimeValue(framesEncoded), timescale: 90)
+                        currentFrameSequence = currentSeq
+                        let currentVisionTimestamp = headerPtr.pointee.visionTimestamp
+                        let currentTransform = headerPtr.pointee.renderHeadTransform
+                        
+                        let refConPtr = UnsafeMutablePointer<FrameContext>.allocate(capacity: 1)
+                        refConPtr.initialize(to: FrameContext(sequence: currentSeq, visionTimestamp: currentVisionTimestamp, transform: currentTransform))
+                        
+                        let status = VTCompressionSessionEncodeFrame(compressionSession!,
+                                                                     imageBuffer: pb,
+                                                                     presentationTimeStamp: presentationTime,
+                                                                     duration: CMTime.invalid,
+                                                                     frameProperties: nil,
+                                                                     sourceFrameRefcon: UnsafeMutableRawPointer(refConPtr),
+                                                                     infoFlagsOut: nil)
+                        
+                        if status != noErr {
+                            print("VTCompressionSessionEncodeFrame failed: \(status)")
+                            refConPtr.deinitialize(count: 1)
+                            refConPtr.deallocate()
+                        }
+                        
+                        framesEncoded += 1
+                    }
                 }
+                lastSeq = currentSeq
+                lastReadIndex = readyIndex
+            } else {
+                // Weak memory ordering on Apple Silicon: latestReadyIndex was updated, 
+                // but sequenceNumber isn't visible yet. Do NOT update lastReadIndex, 
+                // yield briefly and try again.
+                usleep(100)
             }
-            
-            lastSeq = currentSeq
+        } else {
+            usleep(1000)
         }
     }
-    usleep(1000)
 }

@@ -3,13 +3,24 @@ import SwiftUI
 import CoreMedia
 import VideoToolbox
 import CoreImage
+import Metal
+import MetalFX
 
 class VRScreenEntity: Entity, HasModel {
     
     private var compositor: VisionClientCompositor
-    private var videoTexture: TextureResource?
     private weak var appModel: AppModel?
-    private let ciContext = CIContext(options: nil)
+    
+    // MetalFX & DrawableQueue Upscaling components
+    private var drawableQueue: TextureResource.DrawableQueue?
+    
+    // MetalFX Upscaling components
+    private var mtlDevice: MTLDevice?
+    private var commandQueue: MTLCommandQueue?
+    private var textureCache: CVMetalTextureCache?
+    private var spatialScaler: MTLFXSpatialScaler?
+    private var outputTexture: MTLTexture?
+    private var isMetalFXInitialized = false
     
     @MainActor required init() {
         self.compositor = VisionClientCompositor()
@@ -35,8 +46,8 @@ class VRScreenEntity: Entity, HasModel {
         self.position = [0, 0, 0]
         
         // コンポジターからのデコード完了コールバック
-        self.compositor.onFrameDecoded = { [weak self] pixelBuffer in
-            self?.updateTexture(with: pixelBuffer)
+        self.compositor.onFrameDecoded = { [weak self] (pixelBuffer, renderPose) in
+            self?.updateTexture(with: pixelBuffer, renderPose: renderPose)
             
             DispatchQueue.main.async {
                 self?.appModel?.framesReceived += 1
@@ -62,37 +73,98 @@ class VRScreenEntity: Entity, HasModel {
         print("[VRScreenEntity] Initialized. Waiting for Mac UDP Stream...")
     }
     
-    private func updateTexture(with pixelBuffer: CVPixelBuffer) {
-        // CVPixelBuffer -> CGImage
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let cgImg = self.ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-            print("[VRScreenEntity] Failed to create CGImage from CIImage")
+    private func setupMetalFX(inputWidth: Int, inputHeight: Int) {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue() else {
+            print("[VRScreenEntity] Metal not supported")
             return
+        }
+        self.mtlDevice = device
+        self.commandQueue = queue
+        
+        var cache: CVMetalTextureCache?
+        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
+        self.textureCache = cache
+        
+        let descriptor = MTLFXSpatialScalerDescriptor()
+        descriptor.colorTextureFormat = .bgra8Unorm
+        descriptor.outputTextureFormat = .bgra8Unorm
+        descriptor.inputWidth = inputWidth
+        descriptor.inputHeight = inputHeight
+        // Scale 2x for native 4K feeling
+        descriptor.outputWidth = inputWidth * 2
+        descriptor.outputHeight = inputHeight * 2
+        
+        guard let scaler = descriptor.makeSpatialScaler(device: device) else {
+            print("[VRScreenEntity] Failed to create MTLFXSpatialScaler")
+            return
+        }
+        self.spatialScaler = scaler
+        
+        do {
+            let queueDesc = TextureResource.DrawableQueue.Descriptor(
+                pixelFormat: .bgra8Unorm,
+                width: inputWidth * 2,
+                height: inputHeight * 2,
+                usage: [.renderTarget, .shaderRead],
+                mipmapsMode: .none
+            )
+            let queue = try TextureResource.DrawableQueue(queueDesc)
+            self.drawableQueue = queue
+            
+            let texture = try TextureResource.generate(from: queue)
+            DispatchQueue.main.async { [weak self] in
+                var material = UnlitMaterial()
+                material.color = .init(tint: .white, texture: .init(texture))
+                self?.model?.materials = [material]
+            }
+            print("[VRScreenEntity] DrawableQueue created successfully.")
+        } catch {
+            print("[VRScreenEntity] Failed to create DrawableQueue: \(error)")
+        }
+        
+        self.isMetalFXInitialized = true
+        print("[VRScreenEntity] MetalFX Spatial Scaler Initialized (Input: \(inputWidth)x\(inputHeight) -> Output: \(inputWidth*2)x\(inputHeight*2))")
+    }
+    
+    private func updateTexture(with pixelBuffer: CVPixelBuffer, renderPose: simd_float4x4) {
+        let inputWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let inputHeight = CVPixelBufferGetHeight(pixelBuffer)
+        
+        if !isMetalFXInitialized {
+            setupMetalFX(inputWidth: inputWidth, inputHeight: inputHeight)
+        }
+        
+        // Apply MetalFX Spatial Upscaling directly into DrawableQueue
+        if let cache = textureCache, let scaler = spatialScaler, let queue = commandQueue,
+           let drawableQueue = self.drawableQueue,
+           let commandBuffer = queue.makeCommandBuffer() {
+            
+            var cvMetalTexture: CVMetalTexture?
+            CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pixelBuffer, nil, .bgra8Unorm, inputWidth, inputHeight, 0, &cvMetalTexture)
+            
+            if let cvMetalTexture = cvMetalTexture, let inTex = CVMetalTextureGetTexture(cvMetalTexture) {
+                do {
+                    let drawable = try drawableQueue.nextDrawable()
+                    scaler.colorTexture = inTex
+                    scaler.outputTexture = drawable.texture
+                    scaler.encode(commandBuffer: commandBuffer)
+                    commandBuffer.commit()
+                    commandBuffer.waitUntilCompleted()
+                    
+                    // Zero-copy presentation directly to VisionOS Compositor
+                    drawable.present()
+                } catch {
+                    print("[VRScreenEntity] Failed to get next drawable: \(error)")
+                }
+            }
         }
         
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            
-            if self.videoTexture == nil {
-                do {
-                    // 初回テクスチャ生成
-                    let texture = try TextureResource.generate(from: cgImg, options: .init(semantic: .color))
-                    self.videoTexture = texture
-                    
-                    var material = UnlitMaterial()
-                    material.color = .init(texture: .init(texture))
-                    self.model?.materials = [material]
-                } catch {
-                    print("[VRScreenEntity] Failed to generate initial texture: \(error)")
-                }
-            } else {
-                // 以降は既存テクスチャを高速置換
-                do {
-                    try self.videoTexture?.replace(with: cgImg)
-                } catch {
-                    print("[VRScreenEntity] Failed to replace texture: \(error)")
-                }
-            }
+            var newTransform = Transform(matrix: renderPose)
+            newTransform.scale = [-1, 1, 1]
+            self.transform = newTransform
         }
     }
 }

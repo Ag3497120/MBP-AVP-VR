@@ -11,7 +11,8 @@ import QuartzCore
 /// Mac(Verantyx)からのゼロコピー映像のデコードと、JCrossトラッキング情報の送信を行うコアモジュールです。
 public class VisionClientCompositor: NSObject, CBCentralManagerDelegate, HEVCVideoDecoderDelegate {
     
-    public var onFrameDecoded: ((CVPixelBuffer) -> Void)?
+    public var onFrameDecoded: ((CVPixelBuffer, simd_float4x4) -> Void)?
+    private var latestTransform: simd_float4x4 = matrix_identity_float4x4
     
     // --- Network.framework (P2P UDP) ---
     private var listenerConnection: NWConnection?
@@ -24,7 +25,7 @@ public class VisionClientCompositor: NSObject, CBCentralManagerDelegate, HEVCVid
     private var currentSeq: UInt32 = 0
     private var chunksReceived: UInt32 = 0
     private var expectedChunks: UInt32 = 0
-    private var frameBuffer = Data()
+    private var chunkDictionary = [UInt32: Data]()
     
     // --- CoreBluetooth (Discovery) ---
     private var centralManager: CBCentralManager?
@@ -39,9 +40,11 @@ public class VisionClientCompositor: NSObject, CBCentralManagerDelegate, HEVCVid
         setupBluetoothDiscovery()
     }
     
+    private let udpQueue = DispatchQueue(label: "com.verantyx.udpQueue", qos: .userInteractive)
+    
     // MARK: - Discovery & Connection (AirDrop Style)
     private func setupBluetoothDiscovery() {
-        centralManager = CBCentralManager(delegate: self, queue: nil)
+        centralManager = CBCentralManager(delegate: self, queue: .main)
     }
     
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -82,7 +85,7 @@ public class VisionClientCompositor: NSObject, CBCentralManagerDelegate, HEVCVid
             }
         }
         
-        listenerConnection?.start(queue: .main)
+        listenerConnection?.start(queue: udpQueue)
     }
     
     // MARK: - NAL Unit Hardware Decoding
@@ -99,39 +102,52 @@ public class VisionClientCompositor: NSObject, CBCentralManagerDelegate, HEVCVid
     }
     
     private func processUDPPacket(_ data: Data) {
-        guard data.count >= 21 else { return }
+        guard data.count >= 96 else { return }
         
-        // Custom Header parsing: [Magic:4][Seq:4][ChunkIdx:4][TotalChunks:4][IsKey:1][PayloadSize:4]
         let magic = data[0..<4].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
-        guard magic == 0x48455643 else { return } // "HEVC"
+        guard magic == 0x5652414E else { return } // "VRAN"
         
         let seq = data[4..<8].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
         let chunkIdx = data[8..<12].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
         let totalChunks = data[12..<16].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
-        let payloadSize = data[17..<21].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        let chunkOffset = data[16..<20].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        let payloadSize = data[20..<24].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        let timestamp = data[24..<32].withUnsafeBytes { $0.load(as: Double.self) }
+        let transform = data[32..<96].withUnsafeBytes { $0.load(as: simd_float4x4.self) }
+        
+        // Ignore packets from old frames to prevent sequence flapping
+        if seq < currentSeq && (currentSeq - seq) < 10000 {
+            return
+        }
         
         if currentSeq != seq {
             currentSeq = seq
             chunksReceived = 0
             expectedChunks = totalChunks
-            
-            // Reallocate / reset buffer if needed. We assume chunks arrive in order for simplicity.
-            // In a real robust implementation, we'd use chunkIdx to place data at the correct offset.
-            frameBuffer.removeAll(keepingCapacity: true)
+            chunkDictionary.removeAll(keepingCapacity: true)
+            latestTransform = transform
         }
         
-        let payloadData = data.subdata(in: 21..<(21 + Int(payloadSize)))
-        frameBuffer.append(payloadData)
-        chunksReceived += 1
+        let payloadData = data.subdata(in: 96..<(96 + Int(payloadSize)))
+        if chunkDictionary[chunkIdx] == nil {
+            chunkDictionary[chunkIdx] = payloadData
+            chunksReceived += 1
+        }
         
         if chunksReceived == expectedChunks {
-            decoder.decodeAnnexBFrame(frameBuffer)
+            var assembledFrame = Data()
+            for i in 0..<expectedChunks {
+                if let chunk = chunkDictionary[i] {
+                    assembledFrame.append(chunk)
+                }
+            }
+            decoder.decodeAnnexBFrame(assembledFrame)
         }
     }
     
     // MARK: - HEVCVideoDecoderDelegate
     public func didDecodeFrame(_ pixelBuffer: CVPixelBuffer) {
-        onFrameDecoded?(pixelBuffer)
+        onFrameDecoded?(pixelBuffer, latestTransform)
     }
     
     // MARK: - JCross Pose Upload

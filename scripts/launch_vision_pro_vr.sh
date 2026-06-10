@@ -7,7 +7,7 @@ echo "Bypassing SteamVR and using custom OpenVR API wrapper..."
 
 echo "Starting MacEncoderServer (HardwareEncoder)..."
 echo "Starting MacEncoderServer (HardwareEncoder)..."
-cd "$HOME/verantyx-cli/cli"
+cd "$HOME/Verantyx-Mirage/MacEncoder"
 ./HardwareEncoder > "$HOME/Verantyx_VR_Drive/hardware_encoder.log" 2>&1 &
 ENC_PID=$!
 echo "Joy-Cons disabled (Full Hand Tracking active)"

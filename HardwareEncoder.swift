@@ -149,7 +149,7 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
     }
     
     // 3. UDP Fragmentation and Transmission
-    let mtu = 1400
+    let mtu = 1300 // Reduced from 1400 to prevent MTU fragmentation (1300 + 96 header + 28 IP/UDP <= 1500 MTU)
     let totalBytes = frameData.count
     let numFragments = (totalBytes + mtu - 1) / mtu
     

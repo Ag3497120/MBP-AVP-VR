@@ -8,13 +8,12 @@ import QuartzCore
 import CompositorServices
 import Metal
 import MetalKit
+import MetalFX
 /// Phase 14: VisionOS Drop-in SDK (Client Side)
 /// ユーザーが保有する「vision spatial tools」にドロップインで組み込める、
 /// Mac(Verantyx)からのゼロコピー映像のデコードと、JCrossトラッキング情報の送信を行うコアモジュールです。
 public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
-    
-    public var onFrameDecoded: ((CVPixelBuffer, Double) -> Void)?
-    
+    public var onFrameDecoded: ((CVPixelBuffer, Double, simd_float4x4) -> Void)?
     private var listener: NWListener?
     private var trackingConnection: NWConnection?
     private var isTrackingConnectionReady = false
@@ -33,6 +32,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         var maxFrameSize: Int = 0
         var frameBuffer: Data
         var timestamp: Double = 0.0
+        var transform: simd_float4x4 = matrix_identity_float4x4
     }
     private var assemblers: [UInt32: FrameAssembler] = [:]
     
@@ -60,9 +60,15 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         trackingConnection?.cancel()
         trackingConnection = nil
         
-        let trackingParams = NWParameters.udp
+        let udpOptionsTracking = NWProtocolUDP.Options()
+        // Increase UDP receive window to 8MB to absorb high-bitrate video bursts and prevent dropped frames
+        udpOptionsTracking.receiveWindowSize = 8 * 1024 * 1024
+        
+        let trackingParams = NWParameters(dtls: nil, udp: udpOptionsTracking)
         trackingParams.includePeerToPeer = true
-        let joyconParams = NWParameters.udp
+        
+        let udpOptionsJoyc = NWProtocolUDP.Options()
+        let joyconParams = NWParameters(dtls: nil, udp: udpOptionsJoyc)
         joyconParams.includePeerToPeer = true
         
         let targetIP = ip
@@ -133,7 +139,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
     }
     
     private func processUDPPacket(_ data: Data) {
-        guard data.count >= 32 else { return }
+        guard data.count >= 96 else { return }
         
         let magic = data[0..<4].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
         guard magic == 0x5652414E else { return } // Match HardwareEncoder's 0x5652414E
@@ -144,6 +150,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         let chunkOffset = data[16..<20].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
         let payloadSize = data[20..<24].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
         let timestamp = data[24..<32].withUnsafeBytes { $0.load(as: Double.self) }
+        let transform = data[32..<96].withUnsafeBytes { $0.load(as: simd_float4x4.self) }
         
         // Print the first few packets unconditionally to verify reception
         if seq < 10 && chunkIdx == 0 {
@@ -160,8 +167,9 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         var assembler = assemblers[seq] ?? FrameAssembler(frameBuffer: Data(count: Int(totalChunks * 1500)))
         assembler.expectedChunks = totalChunks
         assembler.timestamp = timestamp
+        assembler.transform = transform
         
-        let payloadData = data.subdata(in: 32..<(32 + Int(payloadSize)))
+        let payloadData = data.subdata(in: 96..<(96 + Int(payloadSize)))
         let endOffset = Int(chunkOffset) + Int(payloadSize)
         
         if endOffset > assembler.maxFrameSize {
@@ -187,7 +195,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
                 currentSeq = seq
             }
             
-            if lastDecodedSeq == 0 || seq < lastDecodedSeq {
+            if lastDecodedSeq == 0 || (lastDecodedSeq > seq + 10000) {
                 lastDecodedSeq = seq - 1
             }
             
@@ -196,20 +204,21 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
             // This ensures that a dropped UDP packet (which ruins one frame) DOES NOT freeze the entire stream!
             // Combined with a 0.5s MaxKeyFrameInterval, visual glitches recover instantly without stutter.
             if seq > lastDecodedSeq {
-                decoder.decodeAnnexBFrame(completeFrame, sequence: seq, timestamp: assembler.timestamp)
+                decoder.decodeAnnexBFrame(completeFrame, sequence: seq, timestamp: assembler.timestamp, transform: assembler.transform)
                 lastDecodedSeq = seq
             }
             
-            // Clean up old assemblers to save memory
+            // Clean up old assemblers to save memory. 
+            // Increased from 10 to 30 frames to allow a deeper jitter buffer for late/out-of-order chunks!
             assemblers.removeValue(forKey: seq)
-            let keysToRemove = assemblers.keys.filter { $0 < currentSeq && (currentSeq - $0 > 10) }
+            let keysToRemove = assemblers.keys.filter { $0 < currentSeq && (currentSeq - $0 > 30) }
             for k in keysToRemove { assemblers.removeValue(forKey: k) }
         }
     }
     
     // MARK: - HEVCVideoDecoderDelegate
-    public func didDecodeFrame(_ pixelBuffer: CVPixelBuffer, timestamp: Double) {
-        onFrameDecoded?(pixelBuffer, timestamp)
+    public func didDecodeFrame(_ pixelBuffer: CVPixelBuffer, timestamp: Double, transform: simd_float4x4) {
+        onFrameDecoded?(pixelBuffer, timestamp, transform)
     }
     
     public func sendPose(head: simd_float4x4, leftHand: simd_float4x4, rightHand: simd_float4x4, leftPinch: UInt8, rightPinch: UInt8, leftTrigger: UInt8, rightTrigger: UInt8,
@@ -328,6 +337,13 @@ class CompositorRenderer {
     var pipelineStateNoVideo: MTLRenderPipelineState?
     var samplerState: MTLSamplerState?
     var textureCache: CVMetalTextureCache?
+    
+    // --- MetalFX Upscaling ---
+    private var intermediateTexture: MTLTexture?
+    private var mfxScalerLeft: MTLFXSpatialScaler?
+    private var mfxScalerRight: MTLFXSpatialScaler?
+    private var mfxInputWidth: Int = 0
+    private var mfxInputHeight: Int = 0
     
     // インスタンスに担当しない。AppModel共有バッファを参照する。
     // CompositorLayerクロージャが何度啇び出されても、
@@ -521,6 +537,9 @@ class CompositorRenderer {
             guard let timing = frame.predictTiming() else { continue }
             LayerRenderer.Clock().wait(until: timing.optimalInputTime)
             
+            // 映像フレームを取得 (This pops the latest frame and updates latestTimestamp/Transform)
+            let pb = self.appModel?.latestPixelBuffer
+            
             // In visionOS, we cannot use plain CACurrentMediaTime for the device anchor.
             // We must predict the exact target time using the Compositor's Clock Instant.
             // We now use the exact past timestamp when the frame was rendered by SteamVR
@@ -528,14 +547,13 @@ class CompositorRenderer {
             let effectiveTs = ts > 0 ? ts : CACurrentMediaTime()
             
             // 過去のタイムスタンプを使ってATWの相殺を行う
-            let predictedAnchor = worldTrackingProvider.state == .running
+            var validAnchor = worldTrackingProvider.state == .running
                 ? worldTrackingProvider.queryDeviceAnchor(atTimestamp: effectiveTs)
                 : nil
                 
-            // 未来予測時刻のアンカーが取れなかった場合は、現在時刻のアンカーでフォールバック
-            var validAnchor = predictedAnchor ?? (worldTrackingProvider.state == .running ? worldTrackingProvider.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()) : nil)
-            
-            // それでも取れなかった場合は、前回の有効なアンカーを使用して画面が暗転するのを防ぐ
+            // 履歴バッファから漏れた等でアンカーが取れなかった場合は、前回成功したアンカーを維持する。
+            // 絶対に CACurrentMediaTime()（現在時刻）にはフォールバックしない！
+            // もし現在時刻にフォールバックすると、ATWがゼロになり映像が顔に張り付いて「ガクガク・ブルブル」の原因になるため。
             if validAnchor == nil {
                 validAnchor = lastValidAnchor
             } else {
@@ -543,7 +561,7 @@ class CompositorRenderer {
             }
             
             if renderFrameCount % 300 == 0 {
-                let hasPB = appModel?.latestPixelBuffer != nil
+                let hasPB = pb != nil
                 let anchorStatus = validAnchor == nil ? "NIL (World Origin)" : (predictedAnchor != nil ? "VALID (Predicted)" : "VALID (Fallback/Cached)")
                 let lag = CACurrentMediaTime() - effectiveTs
                 print("[CompositorRenderer] renderFrame=\(renderFrameCount) hasPixelBuffer=\(hasPB) anchor=\(anchorStatus) lag=\(lag*1000)ms ts=\(ts)")
@@ -557,22 +575,21 @@ class CompositorRenderer {
                 drawable.deviceAnchor = anchor
             }
             
+            // Render the frame, passing the already popped pixel buffer
             let currentHeadT = validAnchor?.originFromAnchorTransform ?? matrix_identity_float4x4
-            renderFrame(drawable: drawable, headT: currentHeadT)
+            renderFrame(drawable: drawable, headT: currentHeadT, pb: pb)
             
             frame.endSubmission()
             renderFrameCount += 1
         }
     }
     
-    private func renderFrame(drawable: LayerRenderer.Drawable, headT: simd_float4x4) {
+    private func renderFrame(drawable: LayerRenderer.Drawable, headT: simd_float4x4, pb: CVPixelBuffer?) {
         let isLayered = layerRenderer.configuration.layout == .layered
         let viewCount = drawable.views.count
         
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
         
-        // 映像フレームを取得
-        let pb = appModel?.latestPixelBuffer
         var metalTexture: MTLTexture? = nil
         
         if let pb = pb, let tc = self.textureCache {
@@ -608,7 +625,48 @@ class CompositorRenderer {
         }
         
         let rpdesc = MTLRenderPassDescriptor()
-        rpdesc.colorAttachments[0].texture    = drawable.colorTextures[0]
+        
+        // --- MetalFX Intermediate Texture Setup ---
+        // Determine native output resolution from the drawable
+        let outWidth = drawable.colorTextures[0].width
+        let outHeight = drawable.colorTextures[0].height
+        
+        // Target rendering resolution (Mac side resolution)
+        let inWidth = 1440
+        let inHeight = 1620
+        
+        if intermediateTexture == nil || intermediateTexture?.width != inWidth || intermediateTexture?.height != inHeight {
+            let texDesc = MTLTextureDescriptor()
+            texDesc.textureType = isLayered ? .type2DArray : .type2D
+            texDesc.pixelFormat = layerRenderer.configuration.colorFormat
+            texDesc.width = inWidth
+            texDesc.height = inHeight
+            texDesc.arrayLength = isLayered ? 2 : 1
+            texDesc.usage = [.renderTarget, .shaderRead]
+            texDesc.storageMode = .private
+            intermediateTexture = device.makeTexture(descriptor: texDesc)
+            
+            // Re-create MetalFX Scalers
+            let scalerDesc = MTLFXSpatialScalerDescriptor()
+            scalerDesc.colorTextureFormat = layerRenderer.configuration.colorFormat
+            scalerDesc.outputTextureFormat = layerRenderer.configuration.colorFormat
+            scalerDesc.inputWidth = inWidth
+            scalerDesc.inputHeight = inHeight
+            scalerDesc.outputWidth = outWidth
+            scalerDesc.outputHeight = outHeight
+            scalerDesc.colorProcessingMode = .perceptual
+            
+            do {
+                mfxScalerLeft = try scalerDesc.makeSpatialScaler(device: device)
+                if isLayered {
+                    mfxScalerRight = try scalerDesc.makeSpatialScaler(device: device)
+                }
+            } catch {
+                print("[MetalFX] Error creating scaler: \(error)")
+            }
+        }
+        
+        rpdesc.colorAttachments[0].texture    = intermediateTexture ?? drawable.colorTextures[0]
         rpdesc.colorAttachments[0].loadAction  = .clear
         rpdesc.colorAttachments[0].storeAction = .store
         // 🔥 If video is missing or invalid, clear to BLUE. If video is present, clear to BLACK.
@@ -691,6 +749,31 @@ class CompositorRenderer {
             enc.endEncoding()
         }
         
+        // --- MetalFX Upscaling Pass ---
+        if let interTex = intermediateTexture, let outTex = drawable.colorTextures[0] as MTLTexture? {
+            if isLayered, let scalerL = mfxScalerLeft, let scalerR = mfxScalerRight {
+                // Upscale Left Eye (Slice 0)
+                if let inViewL = interTex.makeTextureView(pixelFormat: interTex.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 0..<1),
+                   let outViewL = outTex.makeTextureView(pixelFormat: outTex.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 0..<1) {
+                    scalerL.colorTexture = inViewL
+                    scalerL.outputTexture = outViewL
+                    scalerL.encode(commandBuffer: commandBuffer)
+                }
+                
+                // Upscale Right Eye (Slice 1)
+                if viewCount > 1, let inViewR = interTex.makeTextureView(pixelFormat: interTex.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 1..<2),
+                   let outViewR = outTex.makeTextureView(pixelFormat: outTex.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 1..<2) {
+                    scalerR.colorTexture = inViewR
+                    scalerR.outputTexture = outViewR
+                    scalerR.encode(commandBuffer: commandBuffer)
+                }
+            } else if let scalerL = mfxScalerLeft {
+                scalerL.colorTexture = interTex
+                scalerL.outputTexture = outTex
+                scalerL.encode(commandBuffer: commandBuffer)
+            }
+        }
+
         drawable.encodePresent(commandBuffer: commandBuffer)
         commandBuffer.commit()
         if let tc = self.textureCache {
@@ -702,7 +785,48 @@ class CompositorRenderer {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
         
         let rpdesc = MTLRenderPassDescriptor()
-        rpdesc.colorAttachments[0].texture    = drawable.colorTextures[0]
+        
+        // --- MetalFX Intermediate Texture Setup ---
+        // Determine native output resolution from the drawable
+        let outWidth = drawable.colorTextures[0].width
+        let outHeight = drawable.colorTextures[0].height
+        
+        // Target rendering resolution (Mac side resolution)
+        let inWidth = 1440
+        let inHeight = 1620
+        
+        if intermediateTexture == nil || intermediateTexture?.width != inWidth || intermediateTexture?.height != inHeight {
+            let texDesc = MTLTextureDescriptor()
+            texDesc.textureType = isLayered ? .type2DArray : .type2D
+            texDesc.pixelFormat = layerRenderer.configuration.colorFormat
+            texDesc.width = inWidth
+            texDesc.height = inHeight
+            texDesc.arrayLength = isLayered ? 2 : 1
+            texDesc.usage = [.renderTarget, .shaderRead]
+            texDesc.storageMode = .private
+            intermediateTexture = device.makeTexture(descriptor: texDesc)
+            
+            // Re-create MetalFX Scalers
+            let scalerDesc = MTLFXSpatialScalerDescriptor()
+            scalerDesc.colorTextureFormat = layerRenderer.configuration.colorFormat
+            scalerDesc.outputTextureFormat = layerRenderer.configuration.colorFormat
+            scalerDesc.inputWidth = inWidth
+            scalerDesc.inputHeight = inHeight
+            scalerDesc.outputWidth = outWidth
+            scalerDesc.outputHeight = outHeight
+            scalerDesc.colorProcessingMode = .perceptual
+            
+            do {
+                mfxScalerLeft = try scalerDesc.makeSpatialScaler(device: device)
+                if isLayered {
+                    mfxScalerRight = try scalerDesc.makeSpatialScaler(device: device)
+                }
+            } catch {
+                print("[MetalFX] Error creating scaler: \(error)")
+            }
+        }
+        
+        rpdesc.colorAttachments[0].texture    = intermediateTexture ?? drawable.colorTextures[0]
         rpdesc.colorAttachments[0].loadAction  = .clear
         rpdesc.colorAttachments[0].storeAction = .store
         rpdesc.colorAttachments[0].clearColor  = color
@@ -734,6 +858,31 @@ class CompositorRenderer {
             enc.endEncoding()
         }
         
+        // --- MetalFX Upscaling Pass ---
+        if let interTex = intermediateTexture, let outTex = drawable.colorTextures[0] as MTLTexture? {
+            if isLayered, let scalerL = mfxScalerLeft, let scalerR = mfxScalerRight {
+                // Upscale Left Eye (Slice 0)
+                if let inViewL = interTex.makeTextureView(pixelFormat: interTex.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 0..<1),
+                   let outViewL = outTex.makeTextureView(pixelFormat: outTex.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 0..<1) {
+                    scalerL.colorTexture = inViewL
+                    scalerL.outputTexture = outViewL
+                    scalerL.encode(commandBuffer: commandBuffer)
+                }
+                
+                // Upscale Right Eye (Slice 1)
+                if viewCount > 1, let inViewR = interTex.makeTextureView(pixelFormat: interTex.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 1..<2),
+                   let outViewR = outTex.makeTextureView(pixelFormat: outTex.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 1..<2) {
+                    scalerR.colorTexture = inViewR
+                    scalerR.outputTexture = outViewR
+                    scalerR.encode(commandBuffer: commandBuffer)
+                }
+            } else if let scalerL = mfxScalerLeft {
+                scalerL.colorTexture = interTex
+                scalerL.outputTexture = outTex
+                scalerL.encode(commandBuffer: commandBuffer)
+            }
+        }
+
         drawable.encodePresent(commandBuffer: commandBuffer)
         commandBuffer.commit()
     }

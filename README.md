@@ -106,6 +106,8 @@ A 4K HEVC encoded frame vastly exceeds the standard 1500-byte UDP MTU.
 - Xcode 15 or newer
 - Game Porting Toolkit (GPTK / D3DMetal)
 - Windows Steam + Half-Life: Alyx (installed inside the GPTK Wine prefix)
+  > [!WARNING]
+  > **Game Data Not Included**: Due to GitHub file size limits and Steam Terms of Service (copyright restrictions), the 70GB+ game data for Half-Life: Alyx and the Windows Steam prefix cannot be provided in this repository. You **must** manually install Steam inside your Wine/GPTK wrapper, log into your own Steam account, and install Half-Life: Alyx into the `drive_c/Program Files (x86)/Steam/steamapps/common/Half-Life Alyx/` directory to use this system.
 - MinGW (`x86_64-w64-mingw32-g++`), Python 3, Swift compiler
 
 ### Cloning and Compilation
