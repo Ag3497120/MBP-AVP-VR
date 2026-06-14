@@ -12,3 +12,4 @@ VRDriver/d3d11.dll
 VRDriver/dxgi.dll
 VRDriver/bin/
 VRDriver/deps/
+*.E
