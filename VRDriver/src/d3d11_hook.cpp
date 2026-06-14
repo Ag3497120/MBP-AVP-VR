@@ -3,6 +3,7 @@
 #include <d3d11_4.h>
 #include <dxgi.h>
 #include <stdio.h>
+#include "d3d11_context_wrapper.h"
 
 void LogProxy(const char* msg) {
     FILE* f = fopen("C:\\proxy_log.txt", "a");
@@ -124,6 +125,10 @@ extern "C" __declspec(dllexport) HRESULT WINAPI D3D11CreateDevice(IDXGIAdapter* 
             pMt->SetMultithreadProtected(TRUE);
             pMt->Release();
         }
+        if (ppImmediateContext && *ppImmediateContext) {
+            *ppImmediateContext = new ProxyID3D11DeviceContext(*ppImmediateContext);
+            LogProxy("[Verantyx] Wrapped ID3D11DeviceContext successfully in D3D11CreateDevice!");
+        }
     }
     
     return hr;
@@ -205,6 +210,10 @@ extern "C" __declspec(dllexport) HRESULT WINAPI D3D11CreateDeviceAndSwapChain(ID
         if (SUCCEEDED((*ppDevice)->QueryInterface(__uuidof(ID3D11Multithread), (void**)&pMt))) {
             pMt->SetMultithreadProtected(TRUE);
             pMt->Release();
+        }
+        if (ppImmediateContext && *ppImmediateContext) {
+            *ppImmediateContext = new ProxyID3D11DeviceContext(*ppImmediateContext);
+            LogProxy("[Verantyx] Wrapped ID3D11DeviceContext successfully in D3D11CreateDeviceAndSwapChain!");
         }
     }
     

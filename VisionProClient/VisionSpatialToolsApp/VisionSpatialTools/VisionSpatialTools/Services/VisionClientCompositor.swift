@@ -244,7 +244,9 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
     public func sendPose(head: simd_float4x4, leftHand: simd_float4x4, rightHand: simd_float4x4, leftPinch: UInt8, rightPinch: UInt8, leftTrigger: UInt8, rightTrigger: UInt8,
                          rightButtons: UInt32 = 0, leftButtons: UInt32 = 0,
                          rightStickX: Float = 0, rightStickY: Float = 0,
-                         leftStickX: Float = 0, leftStickY: Float = 0) {
+                         leftStickX: Float = 0, leftStickY: Float = 0,
+                         leftTangents: simd_float4 = simd_float4(0,0,0,0),
+                         rightTangents: simd_float4 = simd_float4(0,0,0,0)) {
         guard isTrackingConnectionReady, let trackingConnection = trackingConnection else { return }
         
         var packetData = Data()
@@ -271,7 +273,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         // Debug print the translation to prove we are sending active tracking data
         if Int.random(in: 0...60) == 0 {
             let pos = head.columns.3
-            print("[VisionClient] Sending POSE: x=\\(pos.x) y=\\(pos.y) z=\\(pos.z)")
+            print("[VisionClient] Sending POSE: x=\(pos.x) y=\(pos.y) z=\(pos.z) leftTan=\(leftTangents.x)")
         }
         
         appendMatrix(head)
@@ -299,6 +301,11 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         packetData.append(Data(bytes: &rsY, count: 4))
         packetData.append(Data(bytes: &lsX, count: 4))
         packetData.append(Data(bytes: &lsY, count: 4))
+        
+        var lTan = leftTangents
+        var rTan = rightTangents
+        packetData.append(Data(bytes: &lTan, count: 16))
+        packetData.append(Data(bytes: &rTan, count: 16))
         
         trackingConnection.send(content: packetData, completion: .contentProcessed({ error in
             if let error = error {
@@ -405,11 +412,12 @@ class CompositorRenderer {
                                       constant float4 *tangentsArray [[buffer(1)]],
                                       constant float4x4 *headMatrices [[buffer(2)]]) {
             
-            // Fallback to exactly 1.0 to prevent Metal from clipping the quad or causing zero-area intersections
-            float left = tangentsArray[ampID].x;
-            float right = tangentsArray[ampID].y;
-            float top = tangentsArray[ampID].z;
-            float bottom = tangentsArray[ampID].w;
+            // Over-render multiplier to match SteamVR's output, giving SpaceWarp enough margin for fast head movements
+            float overrender = 1.15;
+            float left = tangentsArray[ampID].x * overrender;
+            float right = tangentsArray[ampID].y * overrender;
+            float top = tangentsArray[ampID].z * overrender;
+            float bottom = tangentsArray[ampID].w * overrender;
             
             // Quad perfectly sized to the view frustum at Z = -1
             float2 positions[6] = {
@@ -440,33 +448,54 @@ class CompositorRenderer {
             out.eyeIndex = ampID;
             return out;
         }
-        fragment float4 vrFragmentShader(VertexOut in [[stage_in]],
+        struct FragmentOut {
+            float4 color [[color(0)]];
+            float depth [[depth(any)]];
+        };
+
+        fragment FragmentOut vrFragmentShader(VertexOut in [[stage_in]],
                                        texture2d<float, access::sample> videoTexture [[texture(0)]],
                                        sampler videoSampler [[sampler(0)]]) {
             float2 uv = in.texCoord;
             
-            // SteamVR sends Side-by-Side (SBS) video. 
-            // Left eye (eyeIndex == 0) reads the left half of the texture.
-            // Right eye (eyeIndex == 1) reads the right half.
             if (in.eyeIndex == 0) {
                 uv.x = uv.x * 0.5;
             } else {
                 uv.x = uv.x * 0.5 + 0.5;
             }
             
-            float4 color = videoTexture.sample(videoSampler, uv);
+            // Color is in the top half
+            float2 colorUV = float2(uv.x, uv.y * 0.5);
+            float4 color = videoTexture.sample(videoSampler, colorUV);
             
-            // If the texture is YUV (r8Unorm), G and B channels are 0. Make it grayscale.
             if (color.g == 0.0 && color.b == 0.0 && color.r > 0.0) {
                 color = float4(color.r, color.r, color.r, 1.0);
             }
             
-            return color;
+            // Depth is in the bottom half
+            float2 depthUV = float2(uv.x, uv.y * 0.5 + 0.5);
+            float4 depthSample = videoTexture.sample(videoSampler, depthUV);
+            
+            // Red channel contains the Most Significant Byte of the D24 depth!
+            // Assuming Reverse-Z (Alyx uses Reverse-Z), 1.0 is near, 0.0 is far.
+            // VisionOS expects depth in the range [0, 1] for its own projection.
+            // Wait, LayerRenderer depth format is usually Depth32Float.
+            // We just output the sampled R channel, but INVERT it for VisionOS SpaceWarp
+            // to treat the floor as Near and sky as Far!
+            float rawDepth = depthSample.r;
+            
+            FragmentOut out;
+            out.color = color;
+            out.depth = rawDepth > 0.0 ? (1.0 - rawDepth) : 0.0; // Invert Reverse-Z to Forward-Z!
+            
+            return out;
         }
 
-        fragment float4 vrFragmentShaderNoVideo(VertexOut in [[stage_in]]) {
-            // Just return green when there is no video
-            return float4(0.0, 1.0, 0.0, 1.0);
+        fragment FragmentOut vrFragmentShaderNoVideo(VertexOut in [[stage_in]]) {
+            FragmentOut out;
+            out.color = float4(0.0, 1.0, 0.0, 1.0);
+            out.depth = 0.0;
+            return out;
         }
         """
 
@@ -593,6 +622,16 @@ class CompositorRenderer {
             
             if let anchor = validAnchor {
                 drawable.deviceAnchor = anchor
+            }
+            
+            // 🔥 Save the dynamic tangents so we can transmit them back to SteamVR!
+            if drawable.views.count > 0 {
+                self.appModel?.latestLeftTangents = drawable.views[0].tangents
+                if drawable.views.count > 1 {
+                    self.appModel?.latestRightTangents = drawable.views[1].tangents
+                } else {
+                    self.appModel?.latestRightTangents = drawable.views[0].tangents
+                }
             }
             
             // Render the frame, passing the already popped pixel buffer

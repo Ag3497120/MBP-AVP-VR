@@ -287,7 +287,7 @@ func setupEncoder(width: Int32, height: Int32) {
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse) // Disable B-frames
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
     
-    var bitrate: Int32 = 100_000_000 // Sweet spot for ultra-smooth AWDL streaming at lower resolution
+    var bitrate: Int32 = 30_000_000 // Sweet spot for ultra-smooth AWDL streaming at lower resolution
     let bitrateNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &bitrate)
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateNum)
     
@@ -299,13 +299,19 @@ func setupEncoder(width: Int32, height: Int32) {
     // Force an I-frame every 0.5 seconds (45 frames at 90fps) to ensure immediate recovery from dropped UDP packets!
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 45 as CFNumber)
     
+    // FORCE ZERO FRAME DELAY in the encoder queue
+    var maxFrameDelayCount: Int32 = 1
+    let maxFrameDelayCountNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &maxFrameDelayCount)
+    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: maxFrameDelayCountNum)
+
+    
     VTCompressionSessionPrepareToEncodeFrames(compressionSession!)
 }
 
 // MARK: - Main IPC Loop
 
 let filePath = NSHomeDirectory() + "/Verantyx_VR_Drive/SteamVR_Prefix/drive_c/vr_shared_frame.dat"
-let mapSize = MemoryLayout<DoubleBufferHeader>.size + (Int(MemoryLayout<SharedFrame>.size) + 4096 * 4096 * 4) * 2 + 264 + 1024
+let mapSize = MemoryLayout<DoubleBufferHeader>.size + (Int(MemoryLayout<SharedFrame>.size) + 4096 * 4096 * 8) * 2 + 264 + 1024
 
 print("Waiting for vr_shared_frame.dat...")
 while true {
@@ -335,7 +341,7 @@ if mapPtr == MAP_FAILED {
 }
 
 let basePtr = mapPtr! + MemoryLayout<DoubleBufferHeader>.size
-let frameBlockSize = Int(MemoryLayout<SharedFrame>.size) + 4096 * 4096 * 4
+let frameBlockSize = Int(MemoryLayout<SharedFrame>.size) + 4096 * 4096 * 8
 
 let headers: [UnsafeMutablePointer<SharedFrame>] = [
     basePtr.bindMemory(to: SharedFrame.self, capacity: 1),
@@ -448,7 +454,7 @@ DispatchQueue.global(qos: .userInteractive).async {
                 var magic: UInt32 = 0
                 memcpy(&magic, baseAddr, 4)
 
-                if magic == 0x45534F50 || magic == 0x504F5345 { // "POSE"
+                if magic == 0x45534F50 || magic == 0x504F5345 { print("UDP POSE PACKET SIZE: \(bytesRead)") // "POSE"
                     let visionTs = baseAddr.load(fromByteOffset: 8, as: Double.self)
                     
                     // Vision Pro payload: magic(4) + pad(4) + ts(8) = 16 bytes offset
@@ -481,6 +487,12 @@ DispatchQueue.global(qos: .userInteractive).async {
                         handsMapPtr.advanced(by: 208).storeBytes(of: rightStickY, as: Float.self)
                         handsMapPtr.advanced(by: 212).storeBytes(of: leftStickX, as: Float.self)
                         handsMapPtr.advanced(by: 216).storeBytes(of: leftStickY, as: Float.self)
+                    }
+                    
+                    if bytesRead >= 268 { print("TANGENTS RECV: \(baseAddr.load(fromByteOffset: 236, as: simd_float4.self))")
+                        // baseAddr offset 236 is leftTangents, 252 is rightTangents
+                        memcpy(handsMapPtr + 252, baseAddr + 236, 16)
+                        memcpy(handsMapPtr + 268, baseAddr + 252, 16)
                     }
                     
                     var ipStr = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
@@ -573,11 +585,17 @@ while isEncoding {
                         let refConPtr = UnsafeMutablePointer<FrameContext>.allocate(capacity: 1)
                         refConPtr.initialize(to: FrameContext(sequence: currentSeq, visionTimestamp: currentVisionTimestamp, transform: currentTransform))
                         
+                        var frameProps: CFDictionary? = nil
+                        if framesEncoded % 45 == 0 {
+                            let dict: [CFString: Any] = [kVTEncodeFrameOptionKey_ForceKeyFrame: true]
+                            frameProps = dict as CFDictionary
+                        }
+                        
                         let status = VTCompressionSessionEncodeFrame(compressionSession!,
                                                                      imageBuffer: pb,
                                                                      presentationTimeStamp: presentationTime,
                                                                      duration: CMTime.invalid,
-                                                                     frameProperties: nil,
+                                                                     frameProperties: frameProps,
                                                                      sourceFrameRefcon: UnsafeMutableRawPointer(refConPtr),
                                                                      infoFlagsOut: nil)
                         

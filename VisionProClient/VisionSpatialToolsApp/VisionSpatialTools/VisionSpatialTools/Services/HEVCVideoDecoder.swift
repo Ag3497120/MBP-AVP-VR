@@ -21,10 +21,14 @@ class HEVCVideoDecoder {
     
     private var isH264 = false
     var decodeTimestampQueue = [UInt32: (Double, simd_float4x4)]()
+    let queueLock = NSLock()
     
     // Parses Annex B stream (0x00 0x00 0x00 0x01) and feeds it to VideoToolbox
     func decodeAnnexBFrame(_ frameData: Data, sequence: UInt32, timestamp: Double, transform: simd_float4x4) {
+        queueLock.lock()
         self.decodeTimestampQueue[sequence] = (timestamp, transform)
+        queueLock.unlock()
+
         
         let nals = extractNALUnits(from: frameData)
         var vclNals = [Data]()
@@ -292,8 +296,10 @@ func decompressionSessionCallback(
     let decoder = Unmanaged<HEVCVideoDecoder>.fromOpaque(decompressionOutputRefCon!).takeUnretainedValue()
     
     let seq = UInt32(UInt(bitPattern: sourceFrameRefCon))
+    decoder.queueLock.lock()
     let payload = decoder.decodeTimestampQueue[seq] ?? (0.0, matrix_identity_float4x4)
     decoder.decodeTimestampQueue.removeValue(forKey: seq)
+    decoder.queueLock.unlock()
     
     decoder.delegate?.didDecodeFrame(pixelBuffer, timestamp: payload.0, transform: payload.1)
 }

@@ -52,6 +52,9 @@ class AppModel: ObservableObject {
     nonisolated(unsafe) private var _latestTimestamp: Double = 0.0
     nonisolated(unsafe) private var _latestTransform: simd_float4x4 = matrix_identity_float4x4
     
+    nonisolated(unsafe) var latestLeftTangents: simd_float4 = simd_float4(0,0,0,0)
+    nonisolated(unsafe) var latestRightTangents: simd_float4 = simd_float4(0,0,0,0)
+    
     nonisolated func setLatestPixelBuffer(_ pb: CVPixelBuffer, timestamp: Double, transform: simd_float4x4) {
         _pixelBufferLock.lock()
         _presentationQueue.append((pb, timestamp, transform))
@@ -442,7 +445,9 @@ class AppModel: ObservableObject {
                 rightStickX: rightInputs.stickX,
                 rightStickY: rightInputs.stickY,
                 leftStickX: leftInputs.stickX,
-                leftStickY: leftInputs.stickY
+                leftStickY: leftInputs.stickY,
+                leftTangents: self.latestLeftTangents,
+                rightTangents: self.latestRightTangents
             )
             
             DispatchQueue.main.async { [weak self] in

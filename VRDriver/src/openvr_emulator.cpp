@@ -1,3 +1,8 @@
+#include "d3d11_depth_hook.h"
+
+#include "minhook/include/MinHook.h"
+#pragma comment(lib, "minhook/libMinHook.x64.a")
+
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -21,6 +26,11 @@ void LogMsg(const char* msg) {
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <chrono>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <array>
 
 struct SharedFrame {
     uint32_t sequenceNumber;
@@ -31,7 +41,7 @@ struct SharedFrame {
     double visionTimestamp;
 };
 
-const int MAX_PIXEL_DATA_SIZE = 4096 * 4096 * 4;
+const int MAX_PIXEL_DATA_SIZE = 4096 * 4096 * 8;
 const int FRAME_BLOCK_SIZE = sizeof(SharedFrame) + MAX_PIXEL_DATA_SIZE;
 
 struct DoubleBufferHeader {
@@ -57,6 +67,8 @@ struct SharedHands {
     float rightVelocity[3];
     float leftVelocity[3];
     double visionTimestamp;
+    float leftTangents[4];
+    float rightTangents[4];
 };
 #pragma pack(pop)
 
@@ -67,7 +79,37 @@ static SharedFrame* pHeaders[2] = {NULL, NULL};
 static uint8_t* pPixelDatas[2] = {NULL, NULL};
 static SharedHands* pSharedHands = NULL;
 static uint32_t frameSeq = 1;
-static ID3D11Texture2D* pStagingTexture = NULL;
+#define STAGING_BUFFER_SIZE 3
+struct StagingFrame {
+    ID3D11Texture2D* pColorLeft = nullptr;
+    ID3D11Texture2D* pColorRight = nullptr;
+    ID3D11Texture2D* pDepthLeft = nullptr;
+    ID3D11Texture2D* pDepthRight = nullptr;
+    
+    float uMinL = 0.0f, vMinL = 0.0f, uMaxL = 1.0f, vMaxL = 1.0f;
+    float uMinR = 0.0f, vMinR = 0.0f, uMaxR = 1.0f, vMaxR = 1.0f;
+    double visionTimestamp = 0.0;
+    float renderHeadTransform[16] = {0};
+    bool bIsValid = false;
+    
+    ID3D11DeviceContext* pContext = nullptr;
+    DXGI_FORMAT descFormat;
+    uint32_t descWidth = 0;
+    uint32_t descHeight = 0;
+};
+static StagingFrame g_stagingFrames[STAGING_BUFFER_SIZE];
+static uint32_t g_stagingWriteIndex = 0;
+static uint32_t g_stagingReadIndex = 0;
+
+static std::thread g_copyThread;
+static std::mutex g_copyMutex;
+static std::condition_variable g_copyCv;
+static bool g_copyThreadRunning = false;
+static uint32_t g_pendingCopyIndex = -1;
+static uint32_t g_copyFrameSeq = 1;
+
+void BackgroundCopyThread();
+
 
 float g_handVelocityL[3] = {0,0,0};
 float g_handVelocityR[3] = {0,0,0};
@@ -85,24 +127,27 @@ static float g_lastHeadAngularVel[3] = {0,0,0};
 static double g_lastHeadVisionTimestamp = 0.0;
 static auto g_lastHeadArrivalMacTime = std::chrono::high_resolution_clock::now();
 
-static double g_renderedVisionTimestamp = 0.0;
-static float g_renderedHeadTransform[16] = {0};
+static std::mutex g_poseQueueMutex;
+static std::queue<double> g_poseTimestampQueue;
+static std::queue<std::array<float, 16>> g_poseTransformQueue;
+
+static double g_lastPoppedVisionTimestamp = 0.0;
+static float g_lastPoppedTransform[16] = {0};
 
 void ApplyHeadExtrapolation(vr::TrackedDevicePose_t* pose, float* targetTransform, double visionTimestamp, float fPredictedSecondsToPhotonsFromNow) {
-    // ALWAYS capture the exact timestamp and transform being used for this pose query.
-    // The engine may query the pose right before rendering (bypassing WaitGetPoses timing).
-    g_renderedVisionTimestamp = visionTimestamp;
-    
-    // Disable prediction to eliminate double-transformation!
-    // VisionOS physically places the deviceAnchor at the specified timestamp in 3D space.
-    // If we extrapolate the pose in SteamVR, the virtual camera moves AND the VisionOS anchor moves,
-    // resulting in 2x the movement (violent vertical and horizontal shaking).
+    // DISABLE PREDICTION
     float total_extrapolate = 0.0f;
     
-    for(int r=0; r<3; r++) {
-        for(int c=0; c<4; c++) {
-            g_renderedHeadTransform[c*4+r] = targetTransform[c*4+r];
+    {
+        std::lock_guard<std::mutex> lock(g_poseQueueMutex);
+        if (g_poseTimestampQueue.size() >= 3) {
+            g_poseTimestampQueue.pop();
+            g_poseTransformQueue.pop();
         }
+        g_poseTimestampQueue.push(visionTimestamp);
+        std::array<float, 16> transform;
+        for(int c=0; c<16; c++) transform[c] = targetTransform[c];
+        g_poseTransformQueue.push(transform);
     }
     
     auto now = std::chrono::high_resolution_clock::now();
@@ -481,8 +526,18 @@ class Mock_IVRSystem : public vr::IVRSystem {
 public:
     virtual void GetRecommendedRenderTargetSize(uint32_t *pnWidth, uint32_t *pnHeight) override {
         LogMsg("Called: IVRSystem::GetRecommendedRenderTargetSize\n");
-        if(pnWidth) *pnWidth = 1440;
-        if(pnHeight) *pnHeight = 1620;
+        // Dynamically calculate the perfect aspect ratio directly from the physical tangents!
+        if (pSharedHands && !std::isnan(pSharedHands->leftTangents[0]) && pSharedHands->leftTangents[0] != 0.0f) {
+            float widthScale = (pSharedHands->leftTangents[1] - pSharedHands->leftTangents[0]);
+            float heightScale = std::abs(pSharedHands->leftTangents[2] - pSharedHands->leftTangents[3]);
+            // Apply 1.15x over-render margin to the base resolution
+            if(pnWidth) *pnWidth = (uint32_t)(2000.0f * (widthScale / 2.0f) * 1.15f);
+            if(pnHeight) *pnHeight = (uint32_t)(2000.0f * (heightScale / 2.0f) * 1.15f);
+        } else {
+            // Fallback
+            if(pnWidth) *pnWidth = 1920;
+            if(pnHeight) *pnHeight = 1920;
+        }
     }
     virtual void GetProjectionMatrix(vr::HmdMatrix44_t *pRet, vr::EVREye eEye, float fNearZ, float fFarZ) override {
         if (pRet) {
@@ -500,8 +555,22 @@ public:
         }
     }
     virtual void GetProjectionRaw(EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom) override {
-        LogMsg("Called: IVRSystem::GetProjectionRaw\n");
-        if(pfLeft) *pfLeft = -(1920.0f/2160.0f); if(pfRight) *pfRight = (1920.0f/2160.0f); if(pfTop) *pfTop = -1.0f; if(pfBottom) *pfBottom = 1.0f;
+        // OVERRENDER MARGIN: Render 15% more FOV to hide black borders during fast head movements
+        float overrender = 1.15f;
+        if (pSharedHands && !std::isnan(pSharedHands->leftTangents[0]) && pSharedHands->leftTangents[0] != 0.0f) {
+            float* t = (eEye == vr::Eye_Left) ? pSharedHands->leftTangents : pSharedHands->rightTangents;
+            // Vision Pro tangents: [0]=left, [1]=right, [2]=top, [3]=bottom
+            if(pfLeft) *pfLeft = t[0] * overrender;
+            if(pfRight) *pfRight = t[1] * overrender;
+            if(pfTop) *pfTop = t[2] * overrender;
+            if(pfBottom) *pfBottom = t[3] * overrender;
+        } else {
+            // Fallback
+            if(pfLeft) *pfLeft = -1.0f * overrender; 
+            if(pfRight) *pfRight = 1.0f * overrender; 
+            if(pfTop) *pfTop = 1.0f * overrender; 
+            if(pfBottom) *pfBottom = -1.0f * overrender;
+        }
     }
     virtual bool ComputeDistortion(EVREye eEye, float fU, float fV, DistortionCoordinates_t *pDistortionCoordinates) override {
         if(pDistortionCoordinates) {
@@ -1863,6 +1932,37 @@ public:
         return (EVRCompositorError)1;
     }
     virtual EVRCompositorError Submit(vr::EVREye eEye, const vr::Texture_t *pTexture, const vr::VRTextureBounds_t* pBounds, vr::EVRSubmitFlags nSubmitFlags) override {
+        FILE* f2 = fopen("C:\\VR_Depth_Steal_Log.txt", "a");
+        if (f2 && pTexture && pTexture->handle && pTexture->eType == vr::TextureType_DirectX) {
+            ID3D11Texture2D* pTex = (ID3D11Texture2D*)pTexture->handle;
+            ID3D11Device* pDev = nullptr;
+            pTex->GetDevice(&pDev);
+            if (pDev) {
+                ID3D11DeviceContext* pCtx = nullptr;
+                pDev->GetImmediateContext(&pCtx);
+                if (pCtx) {
+                    ID3D11RenderTargetView* rtv = nullptr;
+                    ID3D11DepthStencilView* dsv = nullptr;
+                    pCtx->OMGetRenderTargets(1, &rtv, &dsv);
+                    fprintf(f2, "OMGetRenderTargets: rtv=%p, dsv=%p\n", rtv, dsv);
+                    if (dsv) dsv->Release();
+                    if (rtv) rtv->Release();
+                    pCtx->Release();
+                }
+                pDev->Release();
+            }
+            fclose(f2);
+        }
+
+        FILE* f = fopen("C:\\VR_Depth_Log.txt", "a");
+        if (f) {
+            fprintf(f, "Submit called! eEye=%d, nSubmitFlags=%d\n", eEye, nSubmitFlags);
+            if (nSubmitFlags & vr::Submit_TextureWithDepth) {
+                fprintf(f, "HAS DEPTH!\n");
+            }
+            fclose(f);
+        }
+
         if(pTexture && pTexture->handle && pTexture->eType == vr::TextureType_DirectX) {
             ID3D11Texture2D* pGameTex = (ID3D11Texture2D*)pTexture->handle;
             D3D11_TEXTURE2D_DESC desc;
@@ -1874,94 +1974,137 @@ public:
                 if (pDevice) {
                     ID3D11DeviceContext* pContext = nullptr;
                     pDevice->GetImmediateContext(&pContext);
-                    
+
                     if (pContext) {
+
                         ID3D11Multithread* pMt = nullptr;
                         pContext->QueryInterface(__uuidof(ID3D11Multithread), (void**)&pMt);
                         if (pMt) { pMt->SetMultithreadProtected(TRUE); pMt->Enter(); }
 
-                        bool needsRecreate = false;
-                        if (pStagingTexture) {
+                        StagingFrame& currentStaging = g_stagingFrames[g_stagingWriteIndex];
+                        
+                        ID3D11Texture2D** ppColorStaging = (eEye == vr::Eye_Left) ? &currentStaging.pColorLeft : &currentStaging.pColorRight;
+                        ID3D11Texture2D** ppDepthStaging = (eEye == vr::Eye_Left) ? &currentStaging.pDepthLeft : &currentStaging.pDepthRight;
+                        
+                        if (*ppColorStaging) {
                             D3D11_TEXTURE2D_DESC existingDesc;
-                            pStagingTexture->GetDesc(&existingDesc);
+                            (*ppColorStaging)->GetDesc(&existingDesc);
                             if (existingDesc.Width != desc.Width || existingDesc.Height != desc.Height || existingDesc.Format != desc.Format) {
-                                pStagingTexture->Release();
-                                pStagingTexture = nullptr;
+                                (*ppColorStaging)->Release();
+                                *ppColorStaging = nullptr;
                             }
                         }
 
-                        if (!pStagingTexture) {
+                        if (!(*ppColorStaging)) {
                             D3D11_TEXTURE2D_DESC stDesc = desc;
                             stDesc.Usage = D3D11_USAGE_STAGING;
                             stDesc.BindFlags = 0;
                             stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
                             stDesc.MiscFlags = 0;
-                            pDevice->CreateTexture2D(&stDesc, nullptr, &pStagingTexture);
+                            pDevice->CreateTexture2D(&stDesc, nullptr, ppColorStaging);
                         }
                         
-                        if (pStagingTexture) {
-                            pContext->CopyResource(pStagingTexture, pGameTex);
-                            
-                            D3D11_MAPPED_SUBRESOURCE mapped;
-                            if (SUCCEEDED(pContext->Map(pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped))) {
-                                    float uMin = pBounds ? pBounds->uMin : 0.0f;
-                                    float vMin = pBounds ? pBounds->vMin : 0.0f;
-                                    float uMax = pBounds ? pBounds->uMax : 1.0f;
-                                    float vMax = pBounds ? pBounds->vMax : 1.0f;
-                                    
-                                    // Sometimes SteamVR passes inverted v bounds
-                                    if (vMin > vMax) {
-                                        float tmp = vMin; vMin = vMax; vMax = tmp;
-                                    }
-                                    if (uMin > uMax) {
-                                        float tmp = uMin; uMin = uMax; uMax = tmp;
-                                    }
-                                    
-                                    uint32_t srcWidth = (uint32_t)(desc.Width * (uMax - uMin));
-                                    uint32_t srcHeight = (uint32_t)(desc.Height * (vMax - vMin));
-                                    uint32_t srcX = (uint32_t)(desc.Width * uMin);
-                                    uint32_t srcY = (uint32_t)(desc.Height * vMin);
-                                    
-                                    uint32_t writeIndex = (frameSeq + 1) % 2;
-                                    SharedFrame* pHeader = pHeaders[writeIndex];
-                                    uint8_t* pPixelData = pPixelDatas[writeIndex];
-                                    
-                                    if (pHeader && pPixelData) {
-                                        pHeader->width = srcWidth * 2;
-                                        pHeader->height = srcHeight;
-                                        pHeader->format = desc.Format;
-                                        if (pSharedHands) {
-                                            pHeader->visionTimestamp = g_renderedVisionTimestamp;
-                                            for(int i=0; i<16; i++) pHeader->renderHeadTransform[i] = g_renderedHeadTransform[i];
-                                        }
-                                    }
-                                    
-                                    uint32_t copyWidth = (srcWidth > 4096) ? 4096 : srcWidth;
-                                    uint32_t copyHeight = (srcHeight > 4096) ? 4096 : srcHeight;
-                                    
-                                    uint8_t* dst = pPixelData;
-                                    uint8_t* src = ((uint8_t*)mapped.pData) + srcY * mapped.RowPitch + srcX * 4;
-                                    
-                                    if (dst && src) {
-                                        if (eEye == vr::Eye_Left) {
-                                            for(uint32_t y=0; y<copyHeight; ++y) {
-                                                memcpy(dst + y * (copyWidth * 2) * 4, src + y * mapped.RowPitch, copyWidth * 4);
-                                            }
-                                        } else {
-                                            // Right eye mapped next to it
-                                            for(uint32_t y=0; y<copyHeight; ++y) {
-                                                memcpy(dst + y * (copyWidth * 2) * 4 + copyWidth * 4, src + y * mapped.RowPitch, copyWidth * 4);
-                                            }
-                                        }
-                                    }
-                                    
-                                    if (eEye == vr::Eye_Right) {
-                                        if (pHeader) pHeader->sequenceNumber = ++frameSeq;
-                                        if (pDbHeader) pDbHeader->latestReadyIndex = writeIndex;
-                                    }
-                                    pContext->Unmap(pStagingTexture, 0);
+                        if (*ppColorStaging) {
+                            pContext->CopyResource(*ppColorStaging, pGameTex);
+                        }
+                        
+                        // Capture bounds and transform for the current frame
+                        float uMin = pBounds ? pBounds->uMin : 0.0f;
+                        float vMin = pBounds ? pBounds->vMin : 0.0f;
+                        float uMax = pBounds ? pBounds->uMax : 1.0f;
+                        float vMax = pBounds ? pBounds->vMax : 1.0f;
+                        
+                        if (vMin > vMax) { float tmp = vMin; vMin = vMax; vMax = tmp; }
+                        if (uMin > uMax) { float tmp = uMin; uMin = uMax; uMax = tmp; }
+                        
+                        if (eEye == vr::Eye_Left) {
+                            currentStaging.uMinL = uMin; currentStaging.vMinL = vMin;
+                            currentStaging.uMaxL = uMax; currentStaging.vMaxL = vMax;
+                            {
+                                std::lock_guard<std::mutex> lock(g_poseQueueMutex);
+                                if (!g_poseTimestampQueue.empty()) {
+                                    g_lastPoppedVisionTimestamp = g_poseTimestampQueue.front();
+                                    for(int i=0; i<16; i++) g_lastPoppedTransform[i] = g_poseTransformQueue.front()[i];
+                                    g_poseTimestampQueue.pop();
+                                    g_poseTransformQueue.pop();
                                 }
                             }
+                            currentStaging.visionTimestamp = g_lastPoppedVisionTimestamp;
+                            for(int i=0; i<16; i++) currentStaging.renderHeadTransform[i] = g_lastPoppedTransform[i];
+                            currentStaging.bIsValid = true;
+                        } else {
+                            currentStaging.uMinR = uMin; currentStaging.vMinR = vMin;
+                            currentStaging.uMaxR = uMax; currentStaging.vMaxR = vMax;
+                            // Do not pop on right eye, because multiple layers or passes might submit to right eye and drain the queue.
+                        }
+                        
+                        // DEPTH CAPTURE
+                        typedef ID3D11Resource* (*GetDepthResource_t)();
+                        HMODULE hD3D11 = GetModuleHandle("d3d11.dll");
+                        if (hD3D11) {
+                            GetDepthResource_t pGetDepth = (GetDepthResource_t)GetProcAddress(hD3D11, "VerantyxGetDepthResource");
+                            if (pGetDepth) {
+                                ID3D11Resource* pDepthRes = pGetDepth();
+                                if (pDepthRes) {
+                                    ID3D11Texture2D* pDepthTex = nullptr;
+                                    if (SUCCEEDED(pDepthRes->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pDepthTex))) {
+                                        D3D11_TEXTURE2D_DESC dDesc;
+                                        pDepthTex->GetDesc(&dDesc);
+                                        
+                                        if (*ppDepthStaging) {
+                                            D3D11_TEXTURE2D_DESC existingDDesc;
+                                            (*ppDepthStaging)->GetDesc(&existingDDesc);
+                                            if (existingDDesc.Width != dDesc.Width || existingDDesc.Height != dDesc.Height || existingDDesc.Format != dDesc.Format) {
+                                                (*ppDepthStaging)->Release();
+                                                *ppDepthStaging = nullptr;
+                                            }
+                                        }
+                                        
+                                        if (!(*ppDepthStaging)) {
+                                            D3D11_TEXTURE2D_DESC stDDesc = dDesc;
+                                            stDDesc.Usage = D3D11_USAGE_STAGING;
+                                            stDDesc.BindFlags = 0;
+                                            stDDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                                            stDDesc.MiscFlags = 0;
+                                            pDevice->CreateTexture2D(&stDDesc, nullptr, ppDepthStaging);
+                                        }
+                                        
+                                        if (*ppDepthStaging) {
+                                            pContext->CopyResource(*ppDepthStaging, pDepthRes);
+                                        }
+                                        pDepthTex->Release();
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Wait until Right Eye is submitted, then read the OLD frame (2 frames ago)
+                        if (eEye == vr::Eye_Right) {
+                            uint32_t readIndex = (g_stagingWriteIndex + 1) % STAGING_BUFFER_SIZE;
+                            StagingFrame& readFrame = g_stagingFrames[readIndex];
+                            
+                            if (readFrame.bIsValid && readFrame.pColorLeft && readFrame.pColorRight) {
+                                if (!g_copyThreadRunning) {
+                                    g_copyThreadRunning = true;
+                                    g_copyThread = std::thread(BackgroundCopyThread);
+                                    g_copyThread.detach();
+                                }
+                                
+                                readFrame.pContext = pContext;
+                                readFrame.descFormat = desc.Format;
+                                readFrame.descWidth = desc.Width;
+                                readFrame.descHeight = desc.Height;
+                                
+                                {
+                                    std::lock_guard<std::mutex> lock(g_copyMutex);
+                                    g_pendingCopyIndex = readIndex;
+                                }
+                                g_copyCv.notify_one();
+                            }
+                            
+                            // Advance write index
+                            g_stagingWriteIndex = (g_stagingWriteIndex + 1) % STAGING_BUFFER_SIZE;
+                        }
                         if (pMt) { pMt->Leave(); pMt->Release(); }
                         pContext->Release();
                     }
@@ -4751,6 +4894,100 @@ extern "C" __declspec(dllexport) bool VR_IsRuntimeInstalled() { return true; }
 #include "iat_hook.h"
 #include <d3d11_4.h> // Include proper header for ID3D11Multithread
 
+
+void BackgroundCopyThread() {
+    while (true) {
+        uint32_t processIndex = -1;
+        {
+            std::unique_lock<std::mutex> lock(g_copyMutex);
+            g_copyCv.wait(lock, []{ return g_pendingCopyIndex != (uint32_t)-1; });
+            processIndex = g_pendingCopyIndex;
+            g_pendingCopyIndex = -1;
+        }
+
+        StagingFrame& readFrame = g_stagingFrames[processIndex];
+        if (readFrame.pContext) {
+            ID3D11Multithread* pMt = nullptr;
+            readFrame.pContext->QueryInterface(__uuidof(ID3D11Multithread), (void**)&pMt);
+            if (pMt) { pMt->SetMultithreadProtected(TRUE); pMt->Enter(); }
+
+            uint32_t srcWidthL = (uint32_t)(readFrame.descWidth * (readFrame.uMaxL - readFrame.uMinL));
+            uint32_t srcHeightL = (uint32_t)(readFrame.descHeight * (readFrame.vMaxL - readFrame.vMinL));
+            uint32_t srcXL = (uint32_t)(readFrame.descWidth * readFrame.uMinL);
+            uint32_t srcYL = (uint32_t)(readFrame.descHeight * readFrame.vMinL);
+
+            uint32_t srcWidthR = (uint32_t)(readFrame.descWidth * (readFrame.uMaxR - readFrame.uMinR));
+            uint32_t srcHeightR = (uint32_t)(readFrame.descHeight * (readFrame.vMaxR - readFrame.vMinR));
+            uint32_t srcXR = (uint32_t)(readFrame.descWidth * readFrame.uMinR);
+            uint32_t srcYR = (uint32_t)(readFrame.descHeight * readFrame.vMinR);
+
+            uint32_t dbWriteIndex = (g_copyFrameSeq + 1) % 2;
+            SharedFrame* pHeader = pHeaders[dbWriteIndex];
+            uint8_t* pPixelData = pPixelDatas[dbWriteIndex];
+
+            if (pHeader && pPixelData) {
+                pHeader->width = srcWidthL * 2;
+                pHeader->height = srcHeightL * 2;
+                pHeader->format = readFrame.descFormat;
+                if (pSharedHands) {
+                    pHeader->visionTimestamp = readFrame.visionTimestamp;
+                    for(int i=0; i<16; i++) pHeader->renderHeadTransform[i] = readFrame.renderHeadTransform[i];
+                }
+
+                uint32_t copyWidthL = (srcWidthL > 4096) ? 4096 : srcWidthL;
+                uint32_t copyHeightL = (srcHeightL > 4096) ? 4096 : srcHeightL;
+                uint32_t copyWidthR = (srcWidthR > 4096) ? 4096 : srcWidthR;
+                uint32_t copyHeightR = (srcHeightR > 4096) ? 4096 : srcHeightR;
+
+                D3D11_MAPPED_SUBRESOURCE mappedColorL, mappedColorR;
+                D3D11_MAPPED_SUBRESOURCE mappedDepthL, mappedDepthR;
+
+                bool hasColorL = SUCCEEDED(readFrame.pContext->Map(readFrame.pColorLeft, 0, D3D11_MAP_READ, 0, &mappedColorL));
+                bool hasColorR = SUCCEEDED(readFrame.pContext->Map(readFrame.pColorRight, 0, D3D11_MAP_READ, 0, &mappedColorR));
+                bool hasDepthL = readFrame.pDepthLeft && SUCCEEDED(readFrame.pContext->Map(readFrame.pDepthLeft, 0, D3D11_MAP_READ, 0, &mappedDepthL));
+                bool hasDepthR = readFrame.pDepthRight && SUCCEEDED(readFrame.pContext->Map(readFrame.pDepthRight, 0, D3D11_MAP_READ, 0, &mappedDepthR));
+
+                if (hasColorL) {
+                    uint8_t* dst = pPixelData;
+                    uint8_t* src = ((uint8_t*)mappedColorL.pData) + srcYL * mappedColorL.RowPitch + srcXL * 4;
+                    for(uint32_t y=0; y<copyHeightL; ++y) {
+                        memcpy(dst + y * (copyWidthL * 2) * 4, src + y * mappedColorL.RowPitch, copyWidthL * 4);
+                    }
+                    readFrame.pContext->Unmap(readFrame.pColorLeft, 0);
+                }
+                if (hasColorR) {
+                    uint8_t* dst = pPixelData;
+                    uint8_t* src = ((uint8_t*)mappedColorR.pData) + srcYR * mappedColorR.RowPitch + srcXR * 4;
+                    for(uint32_t y=0; y<copyHeightR; ++y) {
+                        memcpy(dst + y * (copyWidthL * 2) * 4 + copyWidthL * 4, src + y * mappedColorR.RowPitch, copyWidthR * 4);
+                    }
+                    readFrame.pContext->Unmap(readFrame.pColorRight, 0);
+                }
+
+                uint8_t* depthDstOffset = pPixelData + (copyHeightL * (copyWidthL * 2) * 4);
+                if (hasDepthL) {
+                    uint8_t* src = ((uint8_t*)mappedDepthL.pData) + srcYL * mappedDepthL.RowPitch + srcXL * 4;
+                    for(uint32_t y=0; y<copyHeightL; ++y) {
+                        memcpy(depthDstOffset + y * (copyWidthL * 2) * 4, src + y * mappedDepthL.RowPitch, copyWidthL * 4);
+                    }
+                    readFrame.pContext->Unmap(readFrame.pDepthLeft, 0);
+                }
+                if (hasDepthR) {
+                    uint8_t* src = ((uint8_t*)mappedDepthR.pData) + srcYR * mappedDepthR.RowPitch + srcXR * 4;
+                    for(uint32_t y=0; y<copyHeightR; ++y) {
+                        memcpy(depthDstOffset + y * (copyWidthL * 2) * 4 + copyWidthL * 4, src + y * mappedDepthR.RowPitch, copyWidthR * 4);
+                    }
+                    readFrame.pContext->Unmap(readFrame.pDepthRight, 0);
+                }
+
+                pHeader->sequenceNumber = ++g_copyFrameSeq;
+                if (pDbHeader) pDbHeader->latestReadyIndex = dbWriteIndex;
+            }
+
+            if (pMt) { pMt->Leave(); pMt->Release(); }
+        }
+    }
+}
 
 void LogInitMsg(const char* msg) {}
 
