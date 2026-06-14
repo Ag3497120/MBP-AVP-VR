@@ -122,9 +122,9 @@ class AppModel: ObservableObject {
         // デコードされたフレームを AppModel の共有バッファに保存する
         // CompositorRenderer はこのバッファを直接参照するため、
         // インスタンスが複数存在しても必ず最新フレームが使われる
-        self.compositor.onFrameDecoded = { [weak self] pixelBuffer, timestamp in
+        self.compositor.onFrameDecoded = { [weak self] pixelBuffer, timestamp, transform in
             guard let self = self else { return }
-            self.setLatestPixelBuffer(pixelBuffer, timestamp: timestamp)
+            self.setLatestPixelBuffer(pixelBuffer, timestamp: timestamp, transform: transform)
             DispatchQueue.main.async {
                 self.framesReceived += 1
             }

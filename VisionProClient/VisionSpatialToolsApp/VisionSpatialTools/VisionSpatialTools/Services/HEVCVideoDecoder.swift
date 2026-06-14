@@ -32,44 +32,45 @@ class HEVCVideoDecoder {
         
         let nals = extractNALUnits(from: frameData)
         var vclNals = [Data]()
+        var isH264 = self.isH264
         
         for nal in nals {
             if nal.isEmpty { continue }
             
-            // Check HEVC first
-            let hevcNalType = (nal[0] & 0x7E) >> 1
-            // Check H264
+            let hevcNalType = (nal[0] >> 1) & 0x3F
             let h264NalType = nal[0] & 0x1F
             
             if hevcNalType == 32 { 
-                if vps != nal { vps = nal; formatDescription = nil }
+                if self.vps != nal { self.vps = nal; formatDescription = nil }
                 isH264 = false 
             }
             else if hevcNalType == 33 { 
-                if sps != nal { sps = nal; formatDescription = nil }
+                if self.sps != nal { self.sps = nal; formatDescription = nil }
                 isH264 = false 
             }
             else if hevcNalType == 34 { 
-                if pps != nal { pps = nal; formatDescription = nil }
+                if self.pps != nal { self.pps = nal; formatDescription = nil }
                 isH264 = false 
             }
-            else if vps == nil && h264NalType == 7 { 
-                if sps != nal { sps = nal; formatDescription = nil }
+            else if self.vps == nil && h264NalType == 7 { 
+                if self.sps != nal { self.sps = nal; formatDescription = nil }
                 isH264 = true 
             }
-            else if vps == nil && h264NalType == 8 { 
-                if pps != nal { pps = nal; formatDescription = nil }
+            else if self.vps == nil && h264NalType == 8 { 
+                if self.pps != nal { self.pps = nal; formatDescription = nil }
                 isH264 = true 
             }
             else { vclNals.append(nal) }
         }
         
+        self.isH264 = isH264
+        
         if isH264, formatDescription == nil {
-            print("[HEVCDecoder] Found H264 NALs. SPS: \(sps != nil), PPS: \(pps != nil)")
+            print("[HEVCDecoder] Found H264 NALs. SPS: \(self.sps != nil), PPS: \(self.pps != nil)")
         }
         
         if formatDescription == nil {
-            print("[HEVCDecoder] Attempting to create format desc for frame \(sequence). size: \(frameData.count). isH264: \(isH264), vps: \(vps != nil), sps: \(sps != nil), pps: \(pps != nil)")
+            print("[HEVCDecoder] Attempting to create format desc for frame \(sequence). size: \(frameData.count). isH264: \(isH264), vps: \(self.vps != nil), sps: \(self.sps != nil), pps: \(self.pps != nil)")
         }
         
         // Try to create format description
@@ -78,9 +79,9 @@ class HEVCVideoDecoder {
                 VTDecompressionSessionInvalidate(session)
                 decompressionSession = nil
             }
-            if isH264, let sps = sps, let pps = pps {
+            if isH264, let sps = self.sps, let pps = self.pps {
                 createH264FormatDescription(sps: sps, pps: pps)
-            } else if !isH264, let vps = vps, let sps = sps, let pps = pps {
+            } else if !isH264, let vps = self.vps, let sps = self.sps, let pps = self.pps {
                 createHEVCFormatDescription(vps: vps, sps: sps, pps: pps)
             }
         }
@@ -171,7 +172,11 @@ class HEVCVideoDecoder {
                         formatDescriptionOut: &newFormatDesc
                     )
                     
-                    if status == noErr {
+                    if status == noErr, let newFormatDesc = newFormatDesc {
+                        if let oldFormatDesc = self.formatDescription, CMFormatDescriptionEqual(oldFormatDesc, otherFormatDescription: newFormatDesc) {
+                            // Format description has not changed. No need to recreate the decompression session.
+                            return
+                        }
                         self.formatDescription = newFormatDesc
                         createDecompressionSession()
                     } else {
@@ -184,6 +189,11 @@ class HEVCVideoDecoder {
     
     private func createDecompressionSession() {
         guard let formatDesc = formatDescription else { return }
+        
+        if let existingSession = self.decompressionSession {
+            VTDecompressionSessionInvalidate(existingSession)
+            self.decompressionSession = nil
+        }
         
         let destinationImageBufferAttributes: [String: Any] = [
             kCVPixelBufferMetalCompatibilityKey as String: true,

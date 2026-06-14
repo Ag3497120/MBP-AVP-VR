@@ -62,7 +62,7 @@ public class VisionClientCompositor: NSObject, HEVCVideoDecoderDelegate {
         
         let udpOptionsTracking = NWProtocolUDP.Options()
         // Increase UDP receive window to 8MB to absorb high-bitrate video bursts and prevent dropped frames
-        udpOptionsTracking.receiveWindowSize = 8 * 1024 * 1024
+        // udpOptionsTracking.receiveWindowSize removed
         
         let trackingParams = NWParameters(dtls: nil, udp: udpOptionsTracking)
         trackingParams.includePeerToPeer = true
@@ -611,7 +611,7 @@ class CompositorRenderer {
             
             if renderFrameCount % 300 == 0 {
                 let hasPB = pb != nil
-                let anchorStatus = validAnchor == nil ? "NIL (World Origin)" : (predictedAnchor != nil ? "VALID (Predicted)" : "VALID (Fallback/Cached)")
+                let anchorStatus = validAnchor == nil ? "NIL" : "VALID"
                 let lag = CACurrentMediaTime() - effectiveTs
                 print("[CompositorRenderer] renderFrame=\(renderFrameCount) hasPixelBuffer=\(hasPB) anchor=\(anchorStatus) lag=\(lag*1000)ms ts=\(ts)")
             }
